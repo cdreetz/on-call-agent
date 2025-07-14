@@ -157,24 +157,12 @@ class OnCallAgent:
     
     def _try_parse_diagnosis(self, response: str) -> Optional[str]:
         """Try to parse diagnosis from response"""
-        try:
-            parsed = json.loads(response.strip())
-            return parsed.get("diagnosis")
-        except json.JSONDecodeError:
-            # Try to find diagnosis in text
-            if "diagnosis:" in response.lower():
-                return response.split("diagnosis:")[-1].strip()
-            return None
+        return self.parser.parse_diagnosis(response)
+
     
     def _try_parse_tool_call(self, response: str) -> Optional[tuple]:
         """Try to parse tool call from response"""
-        try:
-            parsed = json.loads(response.strip())
-            if "function" in parsed and "arguments" in parsed:
-                return parsed["function"], parsed["arguments"]
-        except json.JSONDecodeError:
-            pass
-        return None
+        return self.parser.parse_tool_call(response)
     
     def count_tokens(self, text: str) -> int:
         """Count tokens in text"""
@@ -182,8 +170,13 @@ class OnCallAgent:
     
     def generate_response(self, prompt: str) -> str:
         """Generate response from model"""
+        messages = [{"role": "user", "content": prompt}]
+        formatted_prompt = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_propmt=True
+        )
         inputs = self.tokenizer.encode(
-            prompt, 
+            formatted_prompt, 
             return_tensors="pt", 
             truncation=True, 
             max_length=2048

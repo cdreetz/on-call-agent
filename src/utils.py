@@ -6,18 +6,12 @@ import json
 import re
 from typing import Optional, Tuple, Dict, Any
 
-
 class ResponseParser:
     """Parse responses from reasoning models"""
     
     @staticmethod
     def extract_response_from_reasoning(full_response: str) -> Tuple[str, str]:
-        """
-        Extract actual response from reasoning model output.
-        
-        Returns:
-            (response, reasoning) - separated content
-        """
+        """Extract actual response from reasoning model output"""
         if "<think>" in full_response and "</think>" in full_response:
             # Extract reasoning and response
             think_start = full_response.find("<think>")
@@ -32,70 +26,63 @@ class ResponseParser:
             return full_response, ""
     
     @staticmethod
-    def parse_json_response(response: str) -> Optional[Dict[str, Any]]:
-        """
-        Parse JSON from response, handling common issues.
+    def extract_json_from_response(response: str) -> Optional[str]:
+        """Extract JSON from response, handling code blocks and other formatting"""
         
-        Returns:
-            Parsed JSON dict or None if parsing fails
-        """
-        # Try direct parsing first
-        try:
-            return json.loads(response.strip())
-        except json.JSONDecodeError:
-            pass
+        # Remove code block markers (```python, ```json, ```)
+        response = re.sub(r'```(?:python|json)?\s*', '', response)
+        response = re.sub(r'```\s*', '', response)
         
-        # Try to extract JSON from text
-        json_match = re.search(r'\{[^{}]*\}', response)
-        if json_match:
+        # Find JSON patterns - look for {...} that might be valid JSON
+        json_patterns = re.findall(r'\{[^{}]*\}', response)
+        
+        for pattern in json_patterns:
             try:
-                return json.loads(json_match.group(0))
+                # Test if it's valid JSON
+                json.loads(pattern)
+                return pattern
+            except json.JSONDecodeError:
+                continue
+        
+        # If no valid JSON found in patterns, try the whole response cleaned up
+        response_cleaned = response.strip()
+        if response_cleaned.startswith('{') and response_cleaned.endswith('}'):
+            try:
+                json.loads(response_cleaned)
+                return response_cleaned
             except json.JSONDecodeError:
                 pass
         
         return None
     
     @staticmethod
+    def parse_json_response(response: str) -> Optional[Dict[str, Any]]:
+        """Parse JSON from response"""
+        json_str = ResponseParser.extract_json_from_response(response)
+        if json_str:
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                pass
+        return None
+    
+    @staticmethod
     def parse_diagnosis(response: str) -> Optional[str]:
         """Extract diagnosis from response"""
-        # First try JSON parsing
         parsed = ResponseParser.parse_json_response(response)
         if parsed and "diagnosis" in parsed:
             return parsed["diagnosis"]
-        
-        # Fallback to text extraction
-        if "diagnosis:" in response.lower():
-            return response.split("diagnosis:")[-1].strip()
-        
         return None
     
     @staticmethod
     def parse_tool_call(response: str) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """
-        Parse tool call from response, handling different formats.
-        
-        Returns:
-            (tool_name, arguments) or None
-        """
+        """Parse tool call from response"""
         parsed = ResponseParser.parse_json_response(response)
         if not parsed:
             return None
         
-        # Handle Qwen format: {"tool_name": "...", "arg1": "...", "arg2": "..."}
-        if "tool_name" in parsed:
-            tool_name = parsed["tool_name"]
-            arguments = {}
-            
-            # Extract all non-tool_name keys as arguments
-            for key, value in parsed.items():
-                if key != "tool_name":
-                    arguments[key] = value
-            
-            # Map to expected argument names
-            return tool_name, ToolArgumentMapper.map_arguments(tool_name, arguments)
-        
         # Handle standard format: {"function": "...", "arguments": {...}}
-        elif "function" in parsed and "arguments" in parsed:
+        if "function" in parsed and "arguments" in parsed:
             return parsed["function"], parsed["arguments"]
         
         return None
