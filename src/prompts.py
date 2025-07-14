@@ -63,7 +63,7 @@ Continue your investigation or provide your final diagnosis."""
         return """Provide your final diagnosis based on the investigation."""
 
     @staticmethod
-    def get_error_handling_prompt() -> str:
+    def get_error_handling_prompt(error_message: str) -> str:
         """Prompt to handle errors"""
         return f"""Error: {error_message}"""
 
