@@ -12,7 +12,8 @@ from environment import generate_scenario
 from rubric import evaluate_investigation
 
 
-def run_training(config_path: str = None, checkpoint_path: str = None):
+def run_training(config_path: str = None, checkpoint_path: str = None, 
+                 wandb_args: dict = None):
     """Run the main training loop"""
     
     # Load configuration
@@ -31,6 +32,16 @@ def run_training(config_path: str = None, checkpoint_path: str = None):
             accuracy_weight=0.7,
             efficiency_weight=0.3
         )
+    
+    # Override wandb settings if provided
+    if wandb_args:
+        config.use_wandb = not wandb_args.get('no_wandb', False)
+        if wandb_args.get('wandb_project'):
+            config.wandb_project = wandb_args['wandb_project']
+        if wandb_args.get('wandb_entity'):
+            config.wandb_entity = wandb_args['wandb_entity']
+        if wandb_args.get('wandb_name'):
+            config.wandb_run_name = wandb_args['wandb_name']
     
     print("=== RL On-Call Agent Training ===")
     print(f"Configuration:")
@@ -235,7 +246,11 @@ def create_sample_config():
         "efficiency_weight": 0.3,
         "max_investigation_steps": 8,
         "temperature": 0.7,
-        "learning_rate": 1e-5
+        "learning_rate": 1e-5,
+        "use_wandb": True,
+        "wandb_project": "on-call-agent-grpo",
+        "wandb_entity": None,
+        "wandb_run_name": None
     }
     
     config_path = "training_config.json"
@@ -257,11 +272,25 @@ def main():
                        help="Number of scenarios for evaluation")
     parser.add_argument("--resume", action="store_true", 
                        help="Resume training from checkpoint")
+    parser.add_argument("--no-wandb", action="store_true", 
+                       help="Disable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="on-call-agent-grpo",
+                       help="Wandb project name")
+    parser.add_argument("--wandb-entity", type=str, 
+                       help="Wandb entity/team name")
+    parser.add_argument("--wandb-name", type=str, 
+                       help="Wandb run name")
     
     args = parser.parse_args()
     
     if args.mode == "train":
-        trainer, metrics = run_training(args.config, args.checkpoint if args.resume else None)
+        wandb_args = {
+            'no_wandb': args.no_wandb,
+            'wandb_project': args.wandb_project,
+            'wandb_entity': args.wandb_entity,
+            'wandb_name': args.wandb_name
+        }
+        trainer, metrics = run_training(args.config, args.checkpoint if args.resume else None, wandb_args)
         
     elif args.mode == "eval":
         results = run_evaluation(args.checkpoint, args.scenarios)

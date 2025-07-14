@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from dataclasses import dataclass
 from tqdm import tqdm
+import wandb
 
 from environment import InvestigationEnvironment, generate_scenario
 from tools import InvestigationTools
@@ -47,6 +48,12 @@ class TrainingConfig:
     # Logging
     log_every_n_episodes: int = 10
     save_every_n_episodes: int = 50
+    
+    # Wandb config
+    use_wandb: bool = True
+    wandb_project: str = "on-call-agent-grpo"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
 
 
 class OnCallAgent:
@@ -250,6 +257,10 @@ class GRPOTrainer:
         for param in self.ref_model.parameters():
             param.requires_grad = False
         
+        # Initialize wandb if enabled
+        if config.use_wandb:
+            self._init_wandb()
+        
         # Training metrics
         self.training_metrics = {
             "episode_rewards": [],
@@ -260,6 +271,37 @@ class GRPOTrainer:
             "best_reward": 0.0,
             "best_episode": 0
         }
+    
+    def _init_wandb(self):
+        """Initialize Weights & Biases logging"""
+        # Create config dict for wandb
+        wandb_config = {
+            "model_name": self.config.model_name,
+            "num_candidates": self.config.num_candidates,
+            "batch_size": self.config.batch_size,
+            "learning_rate": self.config.learning_rate,
+            "max_episodes": self.config.max_episodes,
+            "accuracy_weight": self.config.accuracy_weight,
+            "efficiency_weight": self.config.efficiency_weight,
+            "max_investigation_steps": self.config.max_investigation_steps,
+            "temperature": self.config.temperature,
+            "group_size": self.config.group_size,
+            "beta": self.config.beta,
+            "clip_range": self.config.clip_range,
+        }
+        
+        wandb.init(
+            project=self.config.wandb_project,
+            entity=self.config.wandb_entity,
+            name=self.config.wandb_run_name,
+            config=wandb_config,
+            tags=["grpo", "on-call-agent", "rl"]
+        )
+        
+        # Watch the model for gradients and parameters
+        wandb.watch(self.agent.model, log="all", log_freq=100)
+        
+        print(f"Initialized wandb project: {self.config.wandb_project}")
     
     def generate_candidate_investigations(self, scenario: Dict[str, Any]) -> List[tuple]:
         """Generate multiple investigation candidates for GRPO"""
@@ -510,6 +552,37 @@ class GRPOTrainer:
                 self.training_metrics["best_reward"] = metrics["max_reward"]
                 self.training_metrics["best_episode"] = episode + 1
             
+            # Log to wandb
+            if self.config.use_wandb:
+                # Create reward distribution histogram
+                episode_rewards = [r for r in all_rewards] if 'all_rewards' in locals() else []
+                
+                log_dict = {
+                    "episode": episode + 1,
+                    "train/mean_reward": metrics["mean_reward"],
+                    "train/max_reward": metrics["max_reward"], 
+                    "train/min_reward": metrics["min_reward"],
+                    "train/avg_accuracy": metrics["avg_accuracy"],
+                    "train/avg_tokens": metrics["avg_tokens"],
+                    "train/avg_steps": metrics["avg_steps"],
+                    "train/policy_loss": metrics["policy_loss"],
+                    "train/kl_divergence": metrics["kl_divergence"],
+                    "train/best_reward": self.training_metrics["best_reward"],
+                    "train/num_candidates": metrics["num_candidates"],
+                    "train/reward_std": np.std(episode_rewards) if episode_rewards else 0.0
+                }
+                
+                # Add learning rate (in case of scheduling)
+                if hasattr(self.optimizer, 'param_groups'):
+                    log_dict["train/learning_rate"] = self.optimizer.param_groups[0]['lr']
+                
+                # Add recent reward trend
+                if len(self.training_metrics["episode_rewards"]) >= 10:
+                    recent_rewards = self.training_metrics["episode_rewards"][-10:]
+                    log_dict["train/recent_10_avg"] = np.mean(recent_rewards)
+                
+                wandb.log(log_dict)
+            
             # Logging
             if (episode + 1) % self.config.log_every_n_episodes == 0:
                 self._log_training_progress(episode + 1, metrics)
@@ -524,6 +597,10 @@ class GRPOTrainer:
         
         print(f"\nTraining completed!")
         print(f"Best reward: {self.training_metrics['best_reward']:.3f} (Episode {self.training_metrics['best_episode']})")
+        
+        # Finish wandb run
+        if self.config.use_wandb:
+            wandb.finish()
         
         return self.training_metrics
     
@@ -561,6 +638,20 @@ class GRPOTrainer:
         print(f"  Tokens: {best_result.total_tokens}")
         print(f"  Reward: {best_metrics.final_reward:.3f}")
         print(f"  Breakdown: Accuracy={best_metrics.accuracy_score:.3f}, Efficiency={best_metrics.efficiency_score:.3f}")
+        
+        # Log example to wandb
+        if self.config.use_wandb:
+            wandb.log({
+                "examples/alert": alert,
+                "examples/ground_truth": str(scenario['incidents'][0] if scenario['incidents'] else 'No incident'),
+                "examples/best_diagnosis": best_result.diagnosis,
+                "examples/best_reward": best_metrics.final_reward,
+                "examples/best_accuracy": best_metrics.accuracy_score,
+                "examples/best_efficiency": best_metrics.efficiency_score,
+                "examples/tokens_used": best_result.total_tokens,
+                "examples/steps_taken": best_result.steps_taken,
+                "examples/actions_taken": str(best_result.actions_taken)
+            })
     
     def _save_checkpoint(self, episode: int):
         """Save model checkpoint"""
