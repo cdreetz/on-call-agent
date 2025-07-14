@@ -285,6 +285,17 @@ class LogSimulator:
                 "period": {"start_time": start_time, "duration_minutes": duration, "total_logs": len(logs)}
             }
         
+        elif scenario_type == "deployment_issue":
+            # General deployment-related issue scenario (e.g., bad deploy)
+            # Simulate a time period with potential failures including deployment impacts
+            duration = random.randint(30, 90)
+            return self.simulate_time_period(start_time, duration, include_failures=True)
+
+        elif scenario_type == "resource_exhaustion":
+            # Resource exhaustion scenario (memory/CPU issues)
+            duration = random.randint(30, 90)
+            return self.simulate_time_period(start_time, duration, include_failures=True)
+
         elif scenario_type == "healthy":
             # No failures, just normal operation
             duration = random.randint(30, 90)
