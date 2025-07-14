@@ -73,6 +73,10 @@ class OnCallAgent:
         if seed is not None:
             torch.manual_seed(seed)
             random.seed(seed)
+
+        debug_file = open("inv_debug.txt", "w")
+        debug_file.write(f"alert: {alert}\n\n")
+        debug_file.write(f"ground truth: {environment.ground_truth}\n\n")
         
         # Initialize tools
         tools = InvestigationTools(environment)
@@ -80,6 +84,8 @@ class OnCallAgent:
         # Build initial prompt
         tool_descriptions = tools.get_tool_descriptions()
         context = OnCallPrompts.format_investigation_prompt(alert, tool_descriptions)
+
+        debug_file.write(f"intiail prompt:\n{context}\n\n")
         
         total_reasoning_tokens = 0
         total_response_tokens = 0
@@ -90,12 +96,19 @@ class OnCallAgent:
         start_time = time.time()
         
         for step in range(self.config.max_investigation_steps):
+            debug_file.write(f"step {step}\n\n")
             # Generate response
             input_tokens = self.count_tokens(context)
             full_response = self.generate_response(context)
 
+            debug_file.write(f"model ouptput {full_response}\n\n")
+
             response, reasoning = self.parser.extract_response_from_reasoning(full_response)
             reasoning_tokens, response_tokens = self.token_counter.count_response_tokens(full_response)
+
+            debug_file.write(f"parsed resposne: {response}\n\n")
+            if reasoning:
++               debug_file.write(f"reasoning: {reasoning}\n\n")
             
             total_input_tokens += input_tokens
             total_reasoning_tokens += reasoning_tokens
@@ -104,7 +117,8 @@ class OnCallAgent:
             # Try to parse response
             diagnosis = self._try_parse_diagnosis(response)
             if diagnosis:
-                # Investigation complete
+                debug_file.write(f"final diagnosis {diagnosis}\n\n")
+                debug_file.close()
                 investigation_time = time.time() - start_time
                 return InvestigationResult(
                     diagnosis=diagnosis,
@@ -122,12 +136,15 @@ class OnCallAgent:
                 tool_name, arguments = tool_call
                 result = tools.execute_tool(tool_name, arguments)
                 actions_taken.append(f"{tool_name}({arguments})")
+
+                debug_file.write(f"tool call {tool_name} {arguments}\n\n")
+                debug_file.write(f"tool result {result}\n\n")
                 
                 # Add result to context
                 context += f"\nAssistant: {response}\n\n"
                 context += OnCallPrompts.get_tool_result_prompt(tool_name, result)
             else:
-                # Invalid response, ask for clarification
+                debug_file.write("invalid response format from tool stuff\n\n")
                 context += f"\nAssistant: {response}\n\n"
                 context += OnCallPrompts.get_error_handling_prompt("Invalid response format. Please provide valid JSON.")
         
