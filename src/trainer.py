@@ -190,7 +190,8 @@ class OnCallAgent:
         messages = [{"role": "user", "content": prompt}]
         formatted_prompt = self.tokenizer.apply_chat_template(
             messages,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            tokenize=False
         )
         inputs = self.tokenizer.encode(
             formatted_prompt, 
@@ -280,15 +281,9 @@ class GRPOTrainer:
         
         # Generate candidates in parallel
         candidates = []
-        with ThreadPoolExecutor(max_workers=self.config.num_candidates) as executor:
-            future_to_seed = {
-                executor.submit(run_candidate, seed): seed 
-                for seed in range(self.config.num_candidates)
-            }
-            
-            for future in as_completed(future_to_seed):
-                result, metrics, error = future.result()
-                candidates.append((result, metrics, error))
+        for seed in range(self.config.num_candidates):
+            result, metrics, error = run_candidate(seed)
+            candidates.append((result, metrics, error))
         
         return candidates
     
