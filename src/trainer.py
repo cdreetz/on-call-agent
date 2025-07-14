@@ -3,13 +3,16 @@ GRPO trainer for the on-call investigation agent
 """
 
 import torch
+import torch.nn.functional as F
 import json
 import random
 import time
-from typing import Dict, List, Any, Optional
+import numpy as np
+from typing import Dict, List, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from dataclasses import dataclass
+from tqdm import tqdm
 
 from environment import InvestigationEnvironment, generate_scenario
 from tools import InvestigationTools
@@ -35,6 +38,11 @@ class TrainingConfig:
     model_name: str = "Qwen/Qwen3-1.7B"
     max_generation_length: int = 200
     temperature: float = 0.7
+    
+    # GRPO specific
+    group_size: int = 5  # Number of candidates per group for GRPO
+    beta: float = 0.1    # KL regularization coefficient
+    clip_range: float = 0.2  # PPO-style clipping
     
     # Logging
     log_every_n_episodes: int = 10
@@ -228,11 +236,27 @@ class GRPOTrainer:
             efficiency_weight=config.efficiency_weight
         )
         
+        # Set up optimizer for GRPO
+        self.optimizer = torch.optim.AdamW(
+            self.agent.model.parameters(), 
+            lr=config.learning_rate,
+            weight_decay=0.01
+        )
+        
+        # Store reference model (frozen copy) for KL regularization
+        self.ref_model = AutoModelForCausalLM.from_pretrained(config.model_name)
+        self.ref_model.to(self.agent.device)
+        self.ref_model.eval()
+        for param in self.ref_model.parameters():
+            param.requires_grad = False
+        
         # Training metrics
         self.training_metrics = {
             "episode_rewards": [],
             "episode_accuracies": [],
             "episode_tokens": [],
+            "policy_losses": [],
+            "kl_divergences": [],
             "best_reward": 0.0,
             "best_episode": 0
         }
@@ -291,16 +315,111 @@ class GRPOTrainer:
         
         return candidates
     
+    def compute_log_probs(self, prompt: str, response: str, model: torch.nn.Module) -> torch.Tensor:
+        """Compute log probabilities for a response given a prompt"""
+        # Tokenize prompt and response
+        messages = [{"role": "user", "content": prompt}]
+        formatted_prompt = self.agent.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
+        
+        # Tokenize the full sequence (prompt + response)
+        full_text = formatted_prompt + response
+        prompt_tokens = self.agent.tokenizer.encode(
+            formatted_prompt, return_tensors="pt", truncation=True, max_length=2048
+        ).to(self.agent.device)
+        full_tokens = self.agent.tokenizer.encode(
+            full_text, return_tensors="pt", truncation=True, max_length=2048
+        ).to(self.agent.device)
+        
+        # Get model predictions
+        with torch.no_grad() if model == self.ref_model else torch.enable_grad():
+            outputs = model(full_tokens)
+            logits = outputs.logits
+        
+        # Extract logits for response tokens only
+        response_start = prompt_tokens.shape[1] - 1
+        response_logits = logits[0, response_start:response_start + (full_tokens.shape[1] - prompt_tokens.shape[1])]
+        response_tokens = full_tokens[0, prompt_tokens.shape[1]:]
+        
+        # Compute log probabilities
+        log_probs = F.log_softmax(response_logits, dim=-1)
+        response_log_probs = log_probs.gather(1, response_tokens.unsqueeze(1)).squeeze(1)
+        
+        return response_log_probs.sum()
+    
+    def compute_grpo_loss(self, prompts: List[str], responses: List[str], 
+                         rewards: List[float], group_size: int) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Compute GRPO loss for a batch of responses"""
+        total_loss = 0.0
+        total_kl = 0.0
+        num_groups = len(prompts) // group_size
+        
+        for group_idx in range(num_groups):
+            # Get group data
+            start_idx = group_idx * group_size
+            end_idx = start_idx + group_size
+            
+            group_prompts = prompts[start_idx:end_idx]
+            group_responses = responses[start_idx:end_idx]
+            group_rewards = torch.tensor(rewards[start_idx:end_idx], device=self.agent.device)
+            
+            # Compute log probabilities for current policy and reference
+            current_log_probs = []
+            ref_log_probs = []
+            
+            for prompt, response in zip(group_prompts, group_responses):
+                current_lp = self.compute_log_probs(prompt, response, self.agent.model)
+                ref_lp = self.compute_log_probs(prompt, response, self.ref_model)
+                current_log_probs.append(current_lp)
+                ref_log_probs.append(ref_lp)
+            
+            current_log_probs = torch.stack(current_log_probs)
+            ref_log_probs = torch.stack(ref_log_probs)
+            
+            # Compute importance weights
+            log_ratios = current_log_probs - ref_log_probs
+            ratios = torch.exp(log_ratios)
+            
+            # Compute group-relative advantages
+            baseline = group_rewards.mean()
+            advantages = group_rewards - baseline
+            
+            # GRPO loss with KL regularization
+            policy_loss = -(ratios * advantages).mean()
+            kl_penalty = self.config.beta * log_ratios.mean()
+            
+            group_loss = policy_loss + kl_penalty
+            total_loss += group_loss
+            total_kl += kl_penalty.item()
+        
+        avg_loss = total_loss / num_groups
+        avg_kl = total_kl / num_groups
+        
+        return avg_loss, {"policy_loss": avg_loss.item(), "kl_divergence": avg_kl}
+    
     def training_step(self, batch_scenarios: List[Dict[str, Any]]) -> Dict[str, float]:
         """Execute one GRPO training step"""
         all_candidates = []
         all_rewards = []
         all_metrics = []
+        all_prompts = []
+        all_responses = []
         
         print(f"Processing {len(batch_scenarios)} scenarios with {self.config.num_candidates} candidates each...")
         
         for i, scenario in enumerate(batch_scenarios):
             print(f"  Scenario {i+1}/{len(batch_scenarios)}: ", end="", flush=True)
+            
+            # Generate environment for this scenario
+            environment = InvestigationEnvironment(scenario)
+            alert = environment.get_alert_message()
+            
+            # Build prompt for this scenario
+            from tools import InvestigationTools
+            tools = InvestigationTools(environment)
+            tool_descriptions = tools.get_tool_descriptions()
+            prompt = OnCallPrompts.format_investigation_prompt(alert, tool_descriptions)
             
             candidates = self.generate_candidate_investigations(scenario)
             
@@ -310,12 +429,38 @@ class GRPOTrainer:
                 all_candidates.append(result)
                 all_rewards.append(metrics.final_reward)
                 all_metrics.append(metrics)
+                all_prompts.append(prompt)
+                # For simplicity, use the diagnosis as the response to train on
+                all_responses.append(result.diagnosis)
                 scenario_rewards.append(metrics.final_reward)
             
             # Print scenario summary
             best_reward = max(scenario_rewards)
             avg_reward = sum(scenario_rewards) / len(scenario_rewards)
             print(f"Best: {best_reward:.3f}, Avg: {avg_reward:.3f}")
+        
+        # Execute GRPO training step
+        if len(all_prompts) >= self.config.group_size:
+            print("  Executing GRPO training step...")
+            self.optimizer.zero_grad()
+            
+            # Compute GRPO loss
+            loss, loss_info = self.compute_grpo_loss(
+                all_prompts, all_responses, all_rewards, self.config.group_size
+            )
+            
+            # Backward pass
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.agent.model.parameters(), 1.0)
+            
+            # Update parameters
+            self.optimizer.step()
+            
+            print(f"  Policy Loss: {loss_info['policy_loss']:.4f}, KL: {loss_info['kl_divergence']:.4f}")
+        else:
+            loss_info = {"policy_loss": 0.0, "kl_divergence": 0.0}
         
         # Calculate training metrics
         avg_reward = sum(all_rewards) / len(all_rewards)
@@ -325,12 +470,6 @@ class GRPOTrainer:
         avg_accuracy = sum(m.accuracy_score for m in all_metrics) / len(all_metrics)
         avg_steps = sum(c.steps_taken for c in all_candidates) / len(all_candidates)
         
-        # TODO: Implement actual GRPO policy gradient update here
-        # This would involve:
-        # 1. Computing log probabilities of generated sequences
-        # 2. Computing group-relative advantages
-        # 3. Backpropagating gradients to update model weights
-        
         return {
             "mean_reward": avg_reward,
             "max_reward": max_reward,
@@ -338,7 +477,9 @@ class GRPOTrainer:
             "avg_tokens": avg_tokens,
             "avg_accuracy": avg_accuracy,
             "avg_steps": avg_steps,
-            "num_candidates": len(all_candidates)
+            "num_candidates": len(all_candidates),
+            "policy_loss": loss_info["policy_loss"],
+            "kl_divergence": loss_info["kl_divergence"]
         }
     
     def train(self, num_episodes: Optional[int] = None) -> Dict[str, List[float]]:
@@ -362,6 +503,8 @@ class GRPOTrainer:
             self.training_metrics["episode_rewards"].append(metrics["mean_reward"])
             self.training_metrics["episode_accuracies"].append(metrics["avg_accuracy"])
             self.training_metrics["episode_tokens"].append(metrics["avg_tokens"])
+            self.training_metrics["policy_losses"].append(metrics["policy_loss"])
+            self.training_metrics["kl_divergences"].append(metrics["kl_divergence"])
             
             if metrics["max_reward"] > self.training_metrics["best_reward"]:
                 self.training_metrics["best_reward"] = metrics["max_reward"]
@@ -374,6 +517,10 @@ class GRPOTrainer:
             # Show detailed example occasionally
             if (episode + 1) % (self.config.log_every_n_episodes * 2) == 0:
                 self._show_example_investigation(batch_scenarios[0])
+            
+            # Save model checkpoint
+            if (episode + 1) % self.config.save_every_n_episodes == 0:
+                self._save_checkpoint(episode + 1)
         
         print(f"\nTraining completed!")
         print(f"Best reward: {self.training_metrics['best_reward']:.3f} (Episode {self.training_metrics['best_episode']})")
@@ -388,6 +535,8 @@ class GRPOTrainer:
         print(f"  Avg Accuracy: {metrics['avg_accuracy']:.3f}")
         print(f"  Avg Tokens: {metrics['avg_tokens']:.1f}")
         print(f"  Avg Steps: {metrics['avg_steps']:.1f}")
+        print(f"  Policy Loss: {metrics['policy_loss']:.4f}")
+        print(f"  KL Divergence: {metrics['kl_divergence']:.4f}")
         
         # Show recent trend
         if len(self.training_metrics["episode_rewards"]) >= 10:
@@ -412,6 +561,23 @@ class GRPOTrainer:
         print(f"  Tokens: {best_result.total_tokens}")
         print(f"  Reward: {best_metrics.final_reward:.3f}")
         print(f"  Breakdown: Accuracy={best_metrics.accuracy_score:.3f}, Efficiency={best_metrics.efficiency_score:.3f}")
+    
+    def _save_checkpoint(self, episode: int):
+        """Save model checkpoint"""
+        import os
+        os.makedirs("checkpoints", exist_ok=True)
+        
+        checkpoint = {
+            "episode": episode,
+            "model_state_dict": self.agent.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "config": self.config,
+            "training_metrics": self.training_metrics
+        }
+        
+        checkpoint_path = f"checkpoints/checkpoint_episode_{episode}.pt"
+        torch.save(checkpoint, checkpoint_path)
+        print(f"  Saved checkpoint: {checkpoint_path}")
 
 
 def main():

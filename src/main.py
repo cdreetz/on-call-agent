@@ -12,7 +12,7 @@ from environment import generate_scenario
 from rubric import evaluate_investigation
 
 
-def run_training(config_path: str = None):
+def run_training(config_path: str = None, checkpoint_path: str = None):
     """Run the main training loop"""
     
     # Load configuration
@@ -27,7 +27,7 @@ def run_training(config_path: str = None):
             batch_size=3,
             max_episodes=50,
             log_every_n_episodes=10,
-            model_name="microsoft/DialoGPT-medium",
+            model_name="Qwen/Qwen3-1.7B",
             accuracy_weight=0.7,
             efficiency_weight=0.3
         )
@@ -44,8 +44,19 @@ def run_training(config_path: str = None):
     # Initialize trainer
     trainer = GRPOTrainer(config)
     
+    # Load checkpoint if resuming
+    start_episode = 0
+    if checkpoint_path:
+        start_episode = load_checkpoint(trainer, checkpoint_path)
+        print(f"Resuming training from episode {start_episode}")
+    
     # Run training
-    training_metrics = trainer.train()
+    remaining_episodes = config.max_episodes - start_episode
+    if remaining_episodes > 0:
+        training_metrics = trainer.train(remaining_episodes)
+    else:
+        print("Training already completed!")
+        training_metrics = trainer.training_metrics
     
     # Save results
     results_path = "training_results.json"
@@ -57,6 +68,16 @@ def run_training(config_path: str = None):
     return trainer, training_metrics
 
 
+def load_checkpoint(trainer: GRPOTrainer, checkpoint_path: str):
+    """Load model from checkpoint"""
+    checkpoint = torch.load(checkpoint_path, map_location=trainer.agent.device)
+    trainer.agent.model.load_state_dict(checkpoint["model_state_dict"])
+    trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    trainer.training_metrics = checkpoint["training_metrics"]
+    print(f"Loaded checkpoint from episode {checkpoint['episode']}")
+    return checkpoint["episode"]
+
+
 def run_evaluation(model_path: str = None, num_scenarios: int = 10):
     """Run evaluation on test scenarios"""
     
@@ -64,7 +85,12 @@ def run_evaluation(model_path: str = None, num_scenarios: int = 10):
     
     # Load model (or use default if no path provided)
     config = TrainingConfig()
-    agent = OnCallAgent(config)
+    trainer = GRPOTrainer(config)
+    
+    if model_path:
+        load_checkpoint(trainer, model_path)
+    
+    agent = trainer.agent
     
     # Generate test scenarios
     test_scenarios = [generate_scenario() for _ in range(num_scenarios)]
@@ -204,7 +230,7 @@ def create_sample_config():
         "batch_size": 4,
         "max_episodes": 100,
         "log_every_n_episodes": 10,
-        "model_name": "microsoft/DialoGPT-medium",
+        "model_name": "Qwen/Qwen3-1.7B",
         "accuracy_weight": 0.7,
         "efficiency_weight": 0.3,
         "max_investigation_steps": 8,
@@ -226,17 +252,19 @@ def main():
     parser.add_argument("--mode", choices=["train", "eval", "demo", "config"], 
                        default="train", help="Mode to run")
     parser.add_argument("--config", type=str, help="Path to configuration file")
-    parser.add_argument("--model", type=str, help="Path to saved model")
+    parser.add_argument("--checkpoint", type=str, help="Path to model checkpoint")
     parser.add_argument("--scenarios", type=int, default=10, 
                        help="Number of scenarios for evaluation")
+    parser.add_argument("--resume", action="store_true", 
+                       help="Resume training from checkpoint")
     
     args = parser.parse_args()
     
     if args.mode == "train":
-        trainer, metrics = run_training(args.config)
+        trainer, metrics = run_training(args.config, args.checkpoint if args.resume else None)
         
     elif args.mode == "eval":
-        results = run_evaluation(args.model, args.scenarios)
+        results = run_evaluation(args.checkpoint, args.scenarios)
         
     elif args.mode == "demo":
         result, metrics = run_single_investigation()
