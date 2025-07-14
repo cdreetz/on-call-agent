@@ -37,13 +37,14 @@ class TrainingConfig:
     
     # Model config
     model_name: str = "Qwen/Qwen3-1.7B"
-    max_generation_length: int = 200
+    max_generation_length: int = 500
     temperature: float = 0.7
     
     # GRPO specific
     group_size: int = 5  # Number of candidates per group for GRPO
     beta: float = 0.1    # KL regularization coefficient
     clip_range: float = 0.2  # PPO-style clipping
+    warmup_episodes: int = 5  # Skip GRPO training for first N episodes
     
     # Logging
     log_every_n_episodes: int = 10
@@ -111,10 +112,14 @@ class OnCallAgent:
         start_time = time.time()
         
         for step in range(self.config.max_investigation_steps):
+            step_start = time.time()
             debug_file.write(f"step {step}\n\n")
             # Generate response
             input_tokens = self.count_tokens(context)
+            gen_start = time.time()
             full_response = self.generate_response(context)
+            gen_time = time.time() - gen_start
+            debug_file.write(f"generation took {gen_time:.2f}s\n\n")
 
             debug_file.write(f"model ouptput {full_response}\n\n")
 
@@ -208,16 +213,20 @@ class OnCallAgent:
             add_generation_prompt=True,
             tokenize=False
         )
-        inputs = self.tokenizer.encode(
+        inputs = self.tokenizer(
             formatted_prompt, 
             return_tensors="pt", 
             truncation=True, 
-            max_length=2048
-        ).to(self.device)
+            max_length=2048,
+            padding=True
+        )
+        input_ids = inputs["input_ids"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
         
         with torch.no_grad():
             outputs = self.model.generate(
-                inputs,
+                input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=self.config.max_generation_length,
                 temperature=self.config.temperature,
                 do_sample=True,
@@ -226,7 +235,7 @@ class OnCallAgent:
             )
         
         response = self.tokenizer.decode(
-            outputs[0][len(inputs[0]):], 
+            outputs[0][len(input_ids[0]):], 
             skip_special_tokens=True
         )
         return response.strip()
@@ -313,7 +322,9 @@ class GRPOTrainer:
         def run_candidate(seed: int) -> tuple:
             """Run single candidate investigation"""
             try:
-                print(f"Starting candidate {seed}")
+                start_time = time.time()
+                print(f"Starting candidate {seed}", end="", flush=True)
+                
                 # Create fresh environment for each candidate
                 candidate_env = InvestigationEnvironment(scenario)
                 result = self.agent.investigate(alert, candidate_env, seed=seed)
@@ -321,6 +332,9 @@ class GRPOTrainer:
                 # Calculate metrics
                 ground_truth = scenario["incidents"][0] if scenario["incidents"] else {}
                 metrics = self.reward_calculator.calculate_reward(result, ground_truth)
+                
+                duration = time.time() - start_time
+                print(f" -> {duration:.1f}s (reward: {metrics.final_reward:.3f})")
                 
                 return result, metrics, None
             except Exception as e:
@@ -440,7 +454,7 @@ class GRPOTrainer:
         
         return avg_loss, {"policy_loss": avg_loss.item(), "kl_divergence": avg_kl}
     
-    def training_step(self, batch_scenarios: List[Dict[str, Any]]) -> Dict[str, float]:
+    def training_step(self, batch_scenarios: List[Dict[str, Any]], episode: int) -> Dict[str, float]:
         """Execute one GRPO training step"""
         all_candidates = []
         all_rewards = []
@@ -481,9 +495,10 @@ class GRPOTrainer:
             avg_reward = sum(scenario_rewards) / len(scenario_rewards)
             print(f"Best: {best_reward:.3f}, Avg: {avg_reward:.3f}")
         
-        # Execute GRPO training step
-        if len(all_prompts) >= self.config.group_size:
-            print("  Executing GRPO training step...")
+        # Execute GRPO training step (skip during warmup)
+        if episode >= self.config.warmup_episodes and len(all_prompts) >= self.config.group_size:
+            grpo_start = time.time()
+            print("  Executing GRPO training step...", end="", flush=True)
             self.optimizer.zero_grad()
             
             # Compute GRPO loss
@@ -500,8 +515,12 @@ class GRPOTrainer:
             # Update parameters
             self.optimizer.step()
             
+            grpo_time = time.time() - grpo_start
+            print(f" -> {grpo_time:.1f}s")
             print(f"  Policy Loss: {loss_info['policy_loss']:.4f}, KL: {loss_info['kl_divergence']:.4f}")
         else:
+            if episode < self.config.warmup_episodes:
+                print(f"  Skipping GRPO training (warmup: {episode+1}/{self.config.warmup_episodes})")
             loss_info = {"policy_loss": 0.0, "kl_divergence": 0.0}
         
         # Calculate training metrics
@@ -539,7 +558,7 @@ class GRPOTrainer:
             batch_scenarios = [generate_scenario() for _ in range(self.config.batch_size)]
             
             # Training step
-            metrics = self.training_step(batch_scenarios)
+            metrics = self.training_step(batch_scenarios, episode)
             
             # Update training metrics
             self.training_metrics["episode_rewards"].append(metrics["mean_reward"])

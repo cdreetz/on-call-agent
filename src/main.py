@@ -24,10 +24,10 @@ def run_training(config_path: str = None, checkpoint_path: str = None,
     else:
         # Default configuration
         config = TrainingConfig(
-            num_candidates=5,
-            batch_size=3,
+            num_candidates=3,  # Reduced for faster iterations
+            batch_size=2,      # Reduced for faster iterations
             max_episodes=50,
-            log_every_n_episodes=10,
+            log_every_n_episodes=5,  # More frequent logging
             model_name="Qwen/Qwen3-1.7B",
             accuracy_weight=0.7,
             efficiency_weight=0.3
