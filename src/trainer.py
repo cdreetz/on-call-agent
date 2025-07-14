@@ -108,7 +108,7 @@ class OnCallAgent:
 
             debug_file.write(f"parsed resposne: {response}\n\n")
             if reasoning:
-+               debug_file.write(f"reasoning: {reasoning}\n\n")
+                debug_file.write(f"reasoning: {reasoning}\n\n")
             
             total_input_tokens += input_tokens
             total_reasoning_tokens += reasoning_tokens
