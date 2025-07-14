@@ -83,5 +83,6 @@ Continue your investigation or provide your final diagnosis."""
         """Format complete investigation prompt with all components"""
         system_prompt = OnCallPrompts.get_system_prompt(tool_descriptions)
         start_prompt = OnCallPrompts.get_investigation_start_prompt(alert)
+
+        return f"{system_prompt}\n\n{start_prompt}"
         
-        return full_prompt
