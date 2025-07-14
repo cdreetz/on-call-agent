@@ -247,6 +247,7 @@ class GRPOTrainer:
         def run_candidate(seed: int) -> tuple:
             """Run single candidate investigation"""
             try:
+                print(f"Starting candidate {seed}")
                 # Create fresh environment for each candidate
                 candidate_env = InvestigationEnvironment(scenario)
                 result = self.agent.investigate(alert, candidate_env, seed=seed)
@@ -257,6 +258,9 @@ class GRPOTrainer:
                 
                 return result, metrics, None
             except Exception as e:
+                print(f"ERROR in candidate {seed}: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 # Return dummy result on error
                 dummy_result = InvestigationResult(
                     diagnosis="Error during investigation",
