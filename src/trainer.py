@@ -26,7 +26,7 @@ from utils import ResponseParser, TokenCounter
 class TrainingConfig:
     """Configuration for training"""
     num_candidates: int = 5
-    max_investigation_steps: int = 8
+    max_investigation_steps: int = 4  # Reduced for faster training
     batch_size: int = 4
     learning_rate: float = 1e-5
     max_episodes: int = 1000
@@ -363,7 +363,7 @@ class GRPOTrainer:
                 )
                 return dummy_result, dummy_metrics, str(e)
         
-        # Generate candidates in parallel
+        # Generate candidates sequentially for now (tokenizer thread safety)
         candidates = []
         for seed in range(self.config.num_candidates):
             result, metrics, error = run_candidate(seed)
@@ -373,36 +373,53 @@ class GRPOTrainer:
     
     def compute_log_probs(self, prompt: str, response: str, model: torch.nn.Module) -> torch.Tensor:
         """Compute log probabilities for a response given a prompt"""
-        # Tokenize prompt and response
-        messages = [{"role": "user", "content": prompt}]
-        formatted_prompt = self.agent.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False
-        )
-        
-        # Tokenize the full sequence (prompt + response)
-        full_text = formatted_prompt + response
-        prompt_tokens = self.agent.tokenizer.encode(
-            formatted_prompt, return_tensors="pt", truncation=True, max_length=2048
-        ).to(self.agent.device)
-        full_tokens = self.agent.tokenizer.encode(
-            full_text, return_tensors="pt", truncation=True, max_length=2048
-        ).to(self.agent.device)
-        
-        # Get model predictions
-        with torch.no_grad() if model == self.ref_model else torch.enable_grad():
-            outputs = model(full_tokens)
-            logits = outputs.logits
-        
-        # Extract logits for response tokens only
-        response_start = prompt_tokens.shape[1] - 1
-        response_logits = logits[0, response_start:response_start + (full_tokens.shape[1] - prompt_tokens.shape[1])]
-        response_tokens = full_tokens[0, prompt_tokens.shape[1]:]
-        
-        # Compute log probabilities
-        log_probs = F.log_softmax(response_logits, dim=-1)
-        response_log_probs = log_probs.gather(1, response_tokens.unsqueeze(1)).squeeze(1)
-        
-        return response_log_probs.sum()
+        try:
+            # Tokenize prompt and response separately
+            messages = [{"role": "user", "content": prompt}]
+            formatted_prompt = self.agent.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=False
+            )
+            
+            # Tokenize prompt and full sequence
+            prompt_tokens = self.agent.tokenizer(
+                formatted_prompt, return_tensors="pt", truncation=True, max_length=1024
+            ).to(self.agent.device)
+            
+            full_text = formatted_prompt + response
+            full_tokens = self.agent.tokenizer(
+                full_text, return_tensors="pt", truncation=True, max_length=1024
+            ).to(self.agent.device)
+            
+            # Skip if response is empty after tokenization
+            if full_tokens.input_ids.shape[1] <= prompt_tokens.input_ids.shape[1]:
+                return torch.tensor(0.0, device=self.agent.device)
+            
+            # Get model predictions
+            with torch.no_grad() if model == self.ref_model else torch.enable_grad():
+                outputs = model(full_tokens.input_ids, attention_mask=full_tokens.attention_mask)
+                logits = outputs.logits
+            
+            # Extract logits and tokens for response only
+            prompt_len = prompt_tokens.input_ids.shape[1]
+            response_logits = logits[0, prompt_len-1:-1]  # Shift by 1 for next token prediction
+            response_tokens = full_tokens.input_ids[0, prompt_len:]
+            
+            # Ensure we have valid tokens
+            if response_tokens.numel() == 0:
+                return torch.tensor(0.0, device=self.agent.device)
+            
+            # Compute log probabilities with numerical stability
+            log_probs = F.log_softmax(response_logits, dim=-1)
+            response_log_probs = log_probs.gather(1, response_tokens.unsqueeze(1)).squeeze(1)
+            
+            # Clamp to prevent extreme values
+            response_log_probs = torch.clamp(response_log_probs, min=-100, max=0)
+            
+            return response_log_probs.sum()
+            
+        except Exception as e:
+            print(f"Error computing log probs: {e}")
+            return torch.tensor(0.0, device=self.agent.device)
     
     def compute_grpo_loss(self, prompts: List[str], responses: List[str], 
                          rewards: List[float], group_size: int) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -411,6 +428,9 @@ class GRPOTrainer:
         total_kl = 0.0
         num_groups = len(prompts) // group_size
         
+        if num_groups == 0:
+            return torch.tensor(0.0, device=self.agent.device), {"policy_loss": 0.0, "kl_divergence": 0.0}
+        
         for group_idx in range(num_groups):
             # Get group data
             start_idx = group_idx * group_size
@@ -418,7 +438,7 @@ class GRPOTrainer:
             
             group_prompts = prompts[start_idx:end_idx]
             group_responses = responses[start_idx:end_idx]
-            group_rewards = torch.tensor(rewards[start_idx:end_idx], device=self.agent.device)
+            group_rewards = torch.tensor(rewards[start_idx:end_idx], device=self.agent.device, dtype=torch.float32)
             
             # Compute log probabilities for current policy and reference
             current_log_probs = []
@@ -433,15 +453,22 @@ class GRPOTrainer:
             current_log_probs = torch.stack(current_log_probs)
             ref_log_probs = torch.stack(ref_log_probs)
             
-            # Compute importance weights
+            # Compute importance weights with numerical stability
             log_ratios = current_log_probs - ref_log_probs
-            ratios = torch.exp(log_ratios)
+            log_ratios = torch.clamp(log_ratios, min=-10, max=10)  # Prevent extreme ratios
             
             # Compute group-relative advantages
             baseline = group_rewards.mean()
             advantages = group_rewards - baseline
             
-            # GRPO loss with KL regularization
+            # Normalize advantages for stability
+            if advantages.std() > 0:
+                advantages = advantages / (advantages.std() + 1e-8)
+            
+            # GRPO loss with importance sampling
+            ratios = torch.exp(log_ratios)
+            ratios = torch.clamp(ratios, min=0.1, max=10.0)  # Prevent extreme ratios
+            
             policy_loss = -(ratios * advantages).mean()
             kl_penalty = self.config.beta * log_ratios.mean()
             
@@ -451,6 +478,11 @@ class GRPOTrainer:
         
         avg_loss = total_loss / num_groups
         avg_kl = total_kl / num_groups
+        
+        # Ensure loss is finite
+        if not torch.isfinite(avg_loss):
+            print("WARNING: Non-finite loss detected, using zero loss")
+            avg_loss = torch.tensor(0.0, device=self.agent.device)
         
         return avg_loss, {"policy_loss": avg_loss.item(), "kl_divergence": avg_kl}
     
