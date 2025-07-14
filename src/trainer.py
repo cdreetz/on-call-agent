@@ -190,7 +190,7 @@ class OnCallAgent:
         messages = [{"role": "user", "content": prompt}]
         formatted_prompt = self.tokenizer.apply_chat_template(
             messages,
-            add_generation_propmt=True
+            add_generation_prompt=True
         )
         inputs = self.tokenizer.encode(
             formatted_prompt, 
