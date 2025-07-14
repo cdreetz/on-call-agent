@@ -86,6 +86,9 @@ class OnCallAgent:
     def investigate(self, alert: str, environment: InvestigationEnvironment, 
                    seed: Optional[int] = None) -> InvestigationResult:
         """Run a complete investigation"""
+        investigation_start = time.time()
+        print(f"\n      [INVESTIGATE] Starting investigation (seed={seed})")
+        
         if seed is not None:
             torch.manual_seed(seed)
             random.seed(seed)
@@ -95,11 +98,17 @@ class OnCallAgent:
         debug_file.write(f"ground truth: {environment.ground_truth}\n\n")
         
         # Initialize tools
+        tools_start = time.time()
         tools = InvestigationTools(environment)
+        tools_time = time.time() - tools_start
+        print(f"      [INVESTIGATE] Tools init: {tools_time:.2f}s")
         
         # Build initial prompt
+        prompt_start = time.time()
         tool_descriptions = tools.get_tool_descriptions()
         context = OnCallPrompts.format_investigation_prompt(alert, tool_descriptions)
+        prompt_time = time.time() - prompt_start
+        print(f"      [INVESTIGATE] Prompt build: {prompt_time:.2f}s")
 
         debug_file.write(f"intiail prompt:\n{context}\n\n")
         
@@ -114,17 +123,23 @@ class OnCallAgent:
         for step in range(self.config.max_investigation_steps):
             step_start = time.time()
             debug_file.write(f"step {step}\n\n")
+            print(f"    Step {step}: ", end="", flush=True)
+            
             # Generate response
             input_tokens = self.count_tokens(context)
             gen_start = time.time()
             full_response = self.generate_response(context)
             gen_time = time.time() - gen_start
+            print(f"gen={gen_time:.1f}s ", end="", flush=True)
             debug_file.write(f"generation took {gen_time:.2f}s\n\n")
 
             debug_file.write(f"model ouptput {full_response}\n\n")
 
+            parse_start = time.time()
             response, reasoning = self.parser.extract_response_from_reasoning(full_response)
             reasoning_tokens, response_tokens = self.token_counter.count_response_tokens(full_response)
+            parse_time = time.time() - parse_start
+            print(f"parse={parse_time:.2f}s ", end="", flush=True)
 
             debug_file.write(f"parsed resposne: {response}\n\n")
             if reasoning:
@@ -135,11 +150,16 @@ class OnCallAgent:
             total_response_tokens += response_tokens
             
             # Try to parse response
+            diag_start = time.time()
             diagnosis = self._try_parse_diagnosis(response)
+            diag_time = time.time() - diag_start
+            print(f"diag={diag_time:.2f}s ", end="", flush=True)
+            
             if diagnosis:
                 debug_file.write(f"final diagnosis {diagnosis}\n\n")
                 debug_file.close()
-                investigation_time = time.time() - start_time
+                investigation_time = time.time() - investigation_start
+                print(f"\n      [INVESTIGATE] COMPLETED in {investigation_time:.2f}s with diagnosis")
                 return InvestigationResult(
                     diagnosis=diagnosis,
                     total_tokens=total_input_tokens + total_response_tokens,
@@ -151,10 +171,14 @@ class OnCallAgent:
                 )
             
             # Try to parse tool call
+            parse_start = time.time()
             tool_call = self._try_parse_tool_call(response)
             if tool_call:
                 tool_name, arguments = tool_call
+                tool_start = time.time()
                 result = tools.execute_tool(tool_name, arguments)
+                tool_time = time.time() - tool_start
+                print(f"tool={tool_time:.1f}s ", end="", flush=True)
                 actions_taken.append(f"{tool_name}({arguments})")
 
                 debug_file.write(f"tool call {tool_name} {arguments}\n\n")
@@ -167,8 +191,13 @@ class OnCallAgent:
                 debug_file.write("invalid response format from tool stuff\n\n")
                 context += f"\nAssistant: {response}\n\n"
                 context += OnCallPrompts.get_error_handling_prompt("Invalid response format. Please provide valid JSON.")
+            
+            step_time = time.time() - step_start
+            print(f"total={step_time:.1f}s")
         
         # Max steps reached, force diagnosis
+        print(f"\n      [INVESTIGATE] Max steps reached, forcing diagnosis...")
+        final_start = time.time()
         context += "\n" + OnCallPrompts.get_diagnosis_request_prompt()
         input_tokens = self.count_tokens(context)
         full_response = self.generate_response(context)
@@ -180,7 +209,10 @@ class OnCallAgent:
         total_response_tokens += response_tokens
         
         diagnosis = self._try_parse_diagnosis(response) or "Unable to determine root cause"
-        investigation_time = time.time() - start_time
+        investigation_time = time.time() - investigation_start
+        final_time = time.time() - final_start
+        print(f"      [INVESTIGATE] Final diagnosis took {final_time:.2f}s")
+        print(f"      [INVESTIGATE] COMPLETED in {investigation_time:.2f}s (max steps)")
         
         return InvestigationResult(
             diagnosis=diagnosis,
@@ -207,12 +239,17 @@ class OnCallAgent:
     
     def generate_response(self, prompt: str) -> str:
         """Generate response from model"""
+        format_start = time.time()
         messages = [{"role": "user", "content": prompt}]
         formatted_prompt = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
             tokenize=False
         )
+        format_time = time.time() - format_start
+        print(f"format={format_time:.2f}s ", end="", flush=True)
+        
+        tokenize_start = time.time()
         inputs = self.tokenizer(
             formatted_prompt, 
             return_tensors="pt", 
@@ -222,7 +259,10 @@ class OnCallAgent:
         )
         input_ids = inputs["input_ids"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
+        tokenize_time = time.time() - tokenize_start
+        print(f"tokenize={tokenize_time:.2f}s ", end="", flush=True)
         
+        generate_start = time.time()
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids,
@@ -233,11 +273,17 @@ class OnCallAgent:
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id
             )
+        generate_time = time.time() - generate_start
+        print(f"generate={generate_time:.2f}s ", end="", flush=True)
         
+        decode_start = time.time()
         response = self.tokenizer.decode(
             outputs[0][len(input_ids[0]):], 
             skip_special_tokens=True
         )
+        decode_time = time.time() - decode_start
+        print(f"decode={decode_time:.2f}s ", end="", flush=True)
+        
         return response.strip()
 
 
@@ -323,18 +369,26 @@ class GRPOTrainer:
             """Run single candidate investigation"""
             try:
                 start_time = time.time()
-                print(f"Starting candidate {seed}", end="", flush=True)
+                print(f"    [CANDIDATE {seed}] Starting...")
                 
                 # Create fresh environment for each candidate
+                env_start = time.time()
                 candidate_env = InvestigationEnvironment(scenario)
+                env_time = time.time() - env_start
+                print(f"    [CANDIDATE {seed}] Environment created in {env_time:.2f}s")
+                
+                # Run investigation
                 result = self.agent.investigate(alert, candidate_env, seed=seed)
                 
                 # Calculate metrics
+                reward_start = time.time()
                 ground_truth = scenario["incidents"][0] if scenario["incidents"] else {}
                 metrics = self.reward_calculator.calculate_reward(result, ground_truth)
+                reward_time = time.time() - reward_start
+                print(f"    [CANDIDATE {seed}] Reward calc in {reward_time:.2f}s")
                 
                 duration = time.time() - start_time
-                print(f" -> {duration:.1f}s (reward: {metrics.final_reward:.3f})")
+                print(f"    [CANDIDATE {seed}] COMPLETED in {duration:.1f}s (reward: {metrics.final_reward:.3f})")
                 
                 return result, metrics, None
             except Exception as e:
