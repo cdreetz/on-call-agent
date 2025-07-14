@@ -37,7 +37,7 @@ class TrainingConfig:
     
     # Model config
     model_name: str = "Qwen/Qwen3-1.7B"
-    max_generation_length: int = 500
+    max_generation_length: int = 32768  # Per Qwen3 recommendations
     temperature: float = 0.7
     
     # GRPO specific
@@ -338,7 +338,8 @@ class OnCallAgent:
         formatted_prompt = self.tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            tokenize=False
+            tokenize=False,
+            enable_thinking=True  # Enable thinking mode per Qwen3 recommendations
         )
         format_time = time.time() - format_start
         
@@ -376,7 +377,10 @@ class OnCallAgent:
                 input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=self.config.max_generation_length,
-                temperature=self.config.temperature,
+                temperature=0.6,  # Per Qwen3 thinking mode recommendations
+                top_p=0.95,       # Per Qwen3 thinking mode recommendations  
+                top_k=20,         # Per Qwen3 recommendations
+                min_p=0.0,        # Per Qwen3 recommendations
                 do_sample=True,
                 pad_token_id=self.tokenizer.eos_token_id,
                 eos_token_id=self.tokenizer.eos_token_id
