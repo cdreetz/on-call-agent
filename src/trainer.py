@@ -265,8 +265,74 @@ class OnCallAgent:
         """Count tokens in text"""
         return len(self.tokenizer.encode(text, truncation=True, max_length=4096))
     
-    def generate_response(self, prompt: str, debug_file=None) -> str:
-        """Generate response from model"""
+    def benchmark_generation(self, debug_file=None):
+        """Benchmark generation to compare with standalone script"""
+        print(f"\n      [BENCHMARK] Running standalone generation test...")
+        
+        # Exact same setup as your working script
+        tool_structure = """
+{
+    'tool_name': 'check_status',
+    'arg1': 'service name to check status of. ex: payment-service',
+    'arg2': 'date to check in mm-yy format'
+}
+"""
+        today = "july 13, 2025"
+        prompt = "can you check to see if the payment service is down today?"
+        
+        messages = [
+            {"role": "system", "content": f"You are a helpful assistant. Please respond with valid JSON for function calling. The expected output structure is {tool_structure}\n\nTodays date: {today}"},
+            {"role": "user", "content": prompt}
+        ]
+        
+        # Test 1: Your exact working setup
+        start_tok = time.time()
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True
+        )
+        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
+        end_tok = time.time()
+        
+        start_gen = time.time()
+        generated_ids = self.model.generate(
+            **model_inputs,
+            max_new_tokens=32768
+        )
+        output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+        end_gen = time.time()
+        
+        benchmark_time = end_gen - start_gen
+        benchmark_tokens = len(output_ids) 
+        benchmark_tok_per_sec = benchmark_tokens / benchmark_time if benchmark_time > 0 else 0
+        
+        print(f"      [BENCHMARK] Your setup: {benchmark_time:.2f}s, {benchmark_tokens} tokens, {benchmark_tok_per_sec:.1f} tok/s")
+        
+        # Test 2: Our current setup for comparison
+        our_start = time.time()
+        our_response = self.generate_response_internal(prompt, debug_file)
+        our_time = time.time() - our_start
+        print(f"      [BENCHMARK] Our setup: {our_time:.2f}s total")
+        
+        if debug_file:
+            debug_file.write(f"\n=== BENCHMARK COMPARISON ===\n")
+            debug_file.write(f"Working setup: {benchmark_time:.2f}s, {benchmark_tokens} tokens, {benchmark_tok_per_sec:.1f} tok/s\n")
+            debug_file.write(f"Our setup: {our_time:.2f}s total\n")
+            debug_file.write(f"Difference: {our_time - benchmark_time:.2f}s slower\n\n")
+    
+    def generate_response_internal(self, prompt: str, debug_file=None) -> str:
+        """Internal generation method with full debugging"""
+        import psutil
+        import torch.cuda
+        
+        # Memory before
+        if torch.cuda.is_available():
+            gpu_mem_before = torch.cuda.memory_allocated() / 1024**3
+            gpu_mem_cached_before = torch.cuda.memory_reserved() / 1024**3
+        cpu_mem_before = psutil.virtual_memory().percent
+        
         format_start = time.time()
         messages = [{"role": "user", "content": prompt}]
         formatted_prompt = self.tokenizer.apply_chat_template(
@@ -275,7 +341,6 @@ class OnCallAgent:
             tokenize=False
         )
         format_time = time.time() - format_start
-        print(f"format={format_time:.2f}s ", end="", flush=True)
         
         tokenize_start = time.time()
         inputs = self.tokenizer(
@@ -288,9 +353,24 @@ class OnCallAgent:
         input_ids = inputs["input_ids"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
         tokenize_time = time.time() - tokenize_start
-        print(f"tokenize={tokenize_time:.2f}s ", end="", flush=True)
         
+        # Memory after tokenization
+        if torch.cuda.is_available():
+            gpu_mem_after_tok = torch.cuda.memory_allocated() / 1024**3
+        
+        # DETAILED generation timing
         generate_start = time.time()
+        
+        # Test different generation modes
+        print(f"\n      [GENERATION DEBUG]")
+        print(f"        Input length: {len(input_ids[0])} tokens")
+        print(f"        Max new tokens: {self.config.max_generation_length}")
+        print(f"        Temperature: {self.config.temperature}")
+        print(f"        Do sample: True")
+        print(f"        Device: {self.device}")
+        print(f"        Model dtype: {next(self.model.parameters()).dtype}")
+        print(f"        GPU mem before: {gpu_mem_before:.2f}GB")
+        
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids,
@@ -303,6 +383,12 @@ class OnCallAgent:
             )
         generate_time = time.time() - generate_start
         
+        # Memory after generation
+        if torch.cuda.is_available():
+            gpu_mem_after_gen = torch.cuda.memory_allocated() / 1024**3
+            gpu_mem_peak = torch.cuda.max_memory_allocated() / 1024**3
+            torch.cuda.reset_peak_memory_stats()
+        
         # Calculate tokens/sec
         generated_tokens = len(outputs[0]) - len(input_ids[0])
         tokens_per_sec = generated_tokens / generate_time if generate_time > 0 else 0
@@ -313,28 +399,54 @@ class OnCallAgent:
         self.generation_count += 1
         avg_tokens_per_sec = self.total_tokens_generated / self.total_generation_time if self.total_generation_time > 0 else 0
         
-        print(f"generate={generate_time:.2f}s({tokens_per_sec:.1f}tok/s,avg={avg_tokens_per_sec:.1f}) ", end="", flush=True)
-        
         decode_start = time.time()
         response = self.tokenizer.decode(
             outputs[0][len(input_ids[0]):], 
             skip_special_tokens=True
         )
         decode_time = time.time() - decode_start
-        print(f"decode={decode_time:.2f}s ", end="", flush=True)
         
-        # Write generation details to debug file
+        # Print comprehensive debug info
+        print(f"        Generated: {generated_tokens} tokens")
+        print(f"        Time: {generate_time:.3f}s")
+        print(f"        Speed: {tokens_per_sec:.1f} tok/s (avg: {avg_tokens_per_sec:.1f})")
+        print(f"        GPU mem delta: {gpu_mem_after_gen - gpu_mem_before:.2f}GB")
+        print(f"        GPU mem peak: {gpu_mem_peak:.2f}GB")
+        
+        # Write EVERYTHING to debug file
         if debug_file:
-            debug_file.write(f"\n--- GENERATION ---\n")
-            debug_file.write(f"Prompt length: {len(input_ids[0])} tokens\n")
-            debug_file.write(f"Generated: {generated_tokens} tokens in {generate_time:.2f}s ({tokens_per_sec:.1f} tok/s)\n")
+            debug_file.write(f"\n=== COMPREHENSIVE GENERATION DEBUG ===\n")
+            debug_file.write(f"Prompt (first 200 chars): {prompt[:200]}...\n")
+            debug_file.write(f"Formatted prompt length: {len(formatted_prompt)} chars\n")
+            debug_file.write(f"Input tokens: {len(input_ids[0])}\n")
+            debug_file.write(f"Generated tokens: {generated_tokens}\n")
+            debug_file.write(f"Max new tokens setting: {self.config.max_generation_length}\n")
             debug_file.write(f"Temperature: {self.config.temperature}\n")
-            debug_file.write(f"Max new tokens: {self.config.max_generation_length}\n")
-            debug_file.write(f"Raw response:\n{response}\n")
-            debug_file.write(f"--- END GENERATION ---\n\n")
+            debug_file.write(f"Do sample: True\n")
+            debug_file.write(f"Device: {self.device}\n")
+            debug_file.write(f"Model dtype: {next(self.model.parameters()).dtype}\n")
+            debug_file.write(f"Tokenization time: {tokenize_time:.3f}s\n")
+            debug_file.write(f"Generation time: {generate_time:.3f}s\n")
+            debug_file.write(f"Decode time: {decode_time:.3f}s\n")
+            debug_file.write(f"Tokens per second: {tokens_per_sec:.1f}\n")
+            debug_file.write(f"GPU memory before: {gpu_mem_before:.2f}GB\n")
+            debug_file.write(f"GPU memory after tokenization: {gpu_mem_after_tok:.2f}GB\n")
+            debug_file.write(f"GPU memory after generation: {gpu_mem_after_gen:.2f}GB\n")
+            debug_file.write(f"GPU memory peak during generation: {gpu_mem_peak:.2f}GB\n")
+            debug_file.write(f"CPU memory usage: {cpu_mem_before:.1f}%\n")
+            debug_file.write(f"Generated response: {response}\n")
+            debug_file.write(f"=== END DEBUG ===\n\n")
             debug_file.flush()
         
         return response.strip()
+    
+    def generate_response(self, prompt: str, debug_file=None) -> str:
+        """Generate response from model with full debugging"""
+        # Run benchmark on first call
+        if self.generation_count == 0:
+            self.benchmark_generation(debug_file)
+        
+        return self.generate_response_internal(prompt, debug_file)
 
 
 class GRPOTrainer:
