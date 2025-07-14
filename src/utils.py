@@ -27,33 +27,42 @@ class ResponseParser:
     
     @staticmethod
     def extract_json_from_response(response: str) -> Optional[str]:
-        """Extract JSON from response, handling code blocks and other formatting"""
+        """Extract JSON from response, handling malformed thinking tags and formatting"""
         
-        # Remove code block markers (```python, ```json, ```)
+        # Remove malformed thinking tags more aggressively
+        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+        response = re.sub(r'<think>.*', '', response, flags=re.DOTALL)  # Handle unclosed tags
+        response = re.sub(r'.*</think>', '', response, flags=re.DOTALL)  # Handle unopened tags
+        
+        # Remove "JSON." or "Assistant:" prefixes
+        response = re.sub(r'^(JSON\.|Assistant:)\s*', '', response, flags=re.MULTILINE)
+        
+        # Remove code block markers
         response = re.sub(r'```(?:python|json)?\s*', '', response)
         response = re.sub(r'```\s*', '', response)
         
-        # Find JSON patterns - look for {...} that might be valid JSON
-        json_patterns = re.findall(r'\{[^{}]*\}', response)
+        # Find all potential JSON objects
+        json_patterns = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response)
         
+        # Try each pattern to see if it's valid JSON
         for pattern in json_patterns:
+            pattern = pattern.strip()
             try:
-                # Test if it's valid JSON
                 json.loads(pattern)
                 return pattern
             except json.JSONDecodeError:
                 continue
         
-        # If no valid JSON found in patterns, try the whole response cleaned up
-        response_cleaned = response.strip()
-        if response_cleaned.startswith('{') and response_cleaned.endswith('}'):
+        # If no complete JSON found, try to find partial JSON and complete it
+        simple_patterns = re.findall(r'\{"function":\s*"[^"]+",\s*"arguments":\s*\{[^}]*\}\}', response)
+        for pattern in simple_patterns:
             try:
-                json.loads(response_cleaned)
-                return response_cleaned
+                json.loads(pattern)
+                return pattern
             except json.JSONDecodeError:
-                pass
+                continue
         
-        return None
+        return None 
     
     @staticmethod
     def parse_json_response(response: str) -> Optional[Dict[str, Any]]:
