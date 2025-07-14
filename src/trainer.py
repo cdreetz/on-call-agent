@@ -66,17 +66,25 @@ class OnCallAgent:
         # Load model and tokenizer
         print(f"Loading model: {config.model_name}")
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(config.model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype="auto",
+            device_map="auto"
+        )
         
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # Move to GPU if available
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
+        # Get device from model
+        self.device = next(self.model.parameters()).device
 
         self.token_counter = TokenCounter(self.tokenizer)
         self.parser = ResponseParser()
+        
+        # Global token tracking
+        self.total_tokens_generated = 0
+        self.total_generation_time = 0.0
+        self.generation_count = 0
         
         print(f"Model loaded on {self.device}")
 
@@ -93,9 +101,12 @@ class OnCallAgent:
             torch.manual_seed(seed)
             random.seed(seed)
 
-        debug_file = open("inv_debug.txt", "w")
-        debug_file.write(f"alert: {alert}\n\n")
-        debug_file.write(f"ground truth: {environment.ground_truth}\n\n")
+        # Create detailed debug file for this investigation
+        debug_filename = f"investigation_seed_{seed}_{int(time.time())}.txt"
+        debug_file = open(debug_filename, "w")
+        debug_file.write(f"=== INVESTIGATION DEBUG SEED {seed} ===\n")
+        debug_file.write(f"Alert: {alert}\n\n")
+        debug_file.write(f"Ground truth: {environment.ground_truth}\n\n")
         
         # Initialize tools
         tools_start = time.time()
@@ -122,13 +133,17 @@ class OnCallAgent:
         
         for step in range(self.config.max_investigation_steps):
             step_start = time.time()
-            debug_file.write(f"step {step}\n\n")
+            debug_file.write(f"=== STEP {step} ===\n")
+            debug_file.write(f"Context length: {len(context)} chars\n")
             print(f"    Step {step}: ", end="", flush=True)
             
-            # Generate response
+            # Check context length
             input_tokens = self.count_tokens(context)
+            if input_tokens > 1800:  # Near token limit
+                print(f"[WARNING: context={input_tokens} tokens] ", end="", flush=True)
+                debug_file.write(f"WARNING: Context approaching limit at {input_tokens} tokens\n")
             gen_start = time.time()
-            full_response = self.generate_response(context)
+            full_response = self.generate_response(context, debug_file)
             gen_time = time.time() - gen_start
             print(f"gen={gen_time:.1f}s ", end="", flush=True)
             debug_file.write(f"generation took {gen_time:.2f}s\n\n")
@@ -149,17 +164,20 @@ class OnCallAgent:
             total_reasoning_tokens += reasoning_tokens
             total_response_tokens += response_tokens
             
-            # Try to parse response
+            # Try to parse response for diagnosis
             diag_start = time.time()
             diagnosis = self._try_parse_diagnosis(response)
             diag_time = time.time() - diag_start
             print(f"diag={diag_time:.2f}s ", end="", flush=True)
             
             if diagnosis:
-                debug_file.write(f"final diagnosis {diagnosis}\n\n")
+                debug_file.write(f"*** EARLY DIAGNOSIS FOUND ***\n")
+                debug_file.write(f"Step {step}: {diagnosis}\n")
+                debug_file.write(f"Total steps taken: {step + 1}\n")
+                debug_file.write(f"Actions taken: {actions_taken}\n\n")
                 debug_file.close()
                 investigation_time = time.time() - investigation_start
-                print(f"\n      [INVESTIGATE] COMPLETED in {investigation_time:.2f}s with diagnosis")
+                print(f"\n      [INVESTIGATE] EARLY COMPLETION in {investigation_time:.2f}s (step {step+1}) with diagnosis: '{diagnosis[:50]}...'")
                 return InvestigationResult(
                     diagnosis=diagnosis,
                     total_tokens=total_input_tokens + total_response_tokens,
@@ -200,7 +218,7 @@ class OnCallAgent:
         final_start = time.time()
         context += "\n" + OnCallPrompts.get_diagnosis_request_prompt()
         input_tokens = self.count_tokens(context)
-        full_response = self.generate_response(context)
+        full_response = self.generate_response(context, debug_file)
 
         response, _ = self.parser.extract_response_from_reasoning(full_response)
         reasoning_tokens, response_tokens = self.token_counter.count_response_tokens(full_response)
@@ -211,6 +229,16 @@ class OnCallAgent:
         diagnosis = self._try_parse_diagnosis(response) or "Unable to determine root cause"
         investigation_time = time.time() - investigation_start
         final_time = time.time() - final_start
+        
+        # Write final summary to debug file
+        debug_file.write(f"\n*** INVESTIGATION SUMMARY ***\n")
+        debug_file.write(f"Total time: {investigation_time:.2f}s\n")
+        debug_file.write(f"Steps taken: {self.config.max_investigation_steps}\n")
+        debug_file.write(f"Final diagnosis: {diagnosis}\n")
+        debug_file.write(f"Actions taken: {actions_taken}\n")
+        debug_file.write(f"Total tokens: input={total_input_tokens}, output={total_response_tokens}\n")
+        debug_file.close()
+        
         print(f"      [INVESTIGATE] Final diagnosis took {final_time:.2f}s")
         print(f"      [INVESTIGATE] COMPLETED in {investigation_time:.2f}s (max steps)")
         
@@ -237,7 +265,7 @@ class OnCallAgent:
         """Count tokens in text"""
         return len(self.tokenizer.encode(text, truncation=True, max_length=4096))
     
-    def generate_response(self, prompt: str) -> str:
+    def generate_response(self, prompt: str, debug_file=None) -> str:
         """Generate response from model"""
         format_start = time.time()
         messages = [{"role": "user", "content": prompt}]
@@ -274,7 +302,18 @@ class OnCallAgent:
                 eos_token_id=self.tokenizer.eos_token_id
             )
         generate_time = time.time() - generate_start
-        print(f"generate={generate_time:.2f}s ", end="", flush=True)
+        
+        # Calculate tokens/sec
+        generated_tokens = len(outputs[0]) - len(input_ids[0])
+        tokens_per_sec = generated_tokens / generate_time if generate_time > 0 else 0
+        
+        # Update global stats
+        self.total_tokens_generated += generated_tokens
+        self.total_generation_time += generate_time
+        self.generation_count += 1
+        avg_tokens_per_sec = self.total_tokens_generated / self.total_generation_time if self.total_generation_time > 0 else 0
+        
+        print(f"generate={generate_time:.2f}s({tokens_per_sec:.1f}tok/s,avg={avg_tokens_per_sec:.1f}) ", end="", flush=True)
         
         decode_start = time.time()
         response = self.tokenizer.decode(
@@ -283,6 +322,17 @@ class OnCallAgent:
         )
         decode_time = time.time() - decode_start
         print(f"decode={decode_time:.2f}s ", end="", flush=True)
+        
+        # Write generation details to debug file
+        if debug_file:
+            debug_file.write(f"\n--- GENERATION ---\n")
+            debug_file.write(f"Prompt length: {len(input_ids[0])} tokens\n")
+            debug_file.write(f"Generated: {generated_tokens} tokens in {generate_time:.2f}s ({tokens_per_sec:.1f} tok/s)\n")
+            debug_file.write(f"Temperature: {self.config.temperature}\n")
+            debug_file.write(f"Max new tokens: {self.config.max_generation_length}\n")
+            debug_file.write(f"Raw response:\n{response}\n")
+            debug_file.write(f"--- END GENERATION ---\n\n")
+            debug_file.flush()
         
         return response.strip()
 
@@ -306,8 +356,12 @@ class GRPOTrainer:
         )
         
         # Store reference model (frozen copy) for KL regularization
-        self.ref_model = AutoModelForCausalLM.from_pretrained(config.model_name)
-        self.ref_model.to(self.agent.device)
+        print(f"Loading reference model: {config.model_name}")
+        self.ref_model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            torch_dtype="auto",
+            device_map="auto"
+        )
         self.ref_model.eval()
         for param in self.ref_model.parameters():
             param.requires_grad = False
