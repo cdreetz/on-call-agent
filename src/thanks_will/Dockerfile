@@ -40,7 +40,7 @@ WORKDIR /workspace
 COPY . /workspace/
 
 # Make sure the code is executable
-RUN chmod +x /workspace/src/thanks_will/main.py
+RUN chmod +x /workspace/main.py
 
 # Default command
-CMD ["python", "/workspace/src/thanks_will/main.py"]
+CMD ["python", "/workspace/main.py"]
