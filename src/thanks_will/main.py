@@ -2,7 +2,7 @@ import os
 from openai import OpenAI
 
 import verifiers as vf
-from obs_env import IncidentAnalysisEnv, incident_data
+from obs_env import IncidentAnalysisEnv
 
 """
 Multi-GPU training (single node, 4 training + 4 inference)
@@ -15,8 +15,8 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --config-file configs/zero3.yaml
 judge_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 incident_env = IncidentAnalysisEnv(
-    incident_data=incident_data,
     judge_client=judge_client,
+    dataset="cdreetz/on-call-agent-grpo-dataset",
     max_turns=10
 )
 
@@ -40,9 +40,7 @@ trainer = vf.GRPOTrainer(
     model=model,
     process_class=tokenizer,
     env=incident_env,
-    args=vf.GRPOConfig(
-        num_generations=10
-    )
+    args=training_args
 )
 
 trainer.train()

@@ -2,13 +2,17 @@ import json
 from typing import List, Dict, Any
 from datetime import datetime
 import re
-
+import verifiers as vf
+from datasets import Dataset, load_dataset
 from rub import IncidentAnalysisRubric
 
 class IncidentDataStore:
     def __init__(self, incident_data: Dict[str, Any]):
         self.data = incident_data
-        self.state = incident_data.get('state', {})
+        if 'state' in incident_data:
+            self.state = incident_data['state']
+        else:
+            self.state = incident_data
     
     def get_status_pages(self) -> List[Dict[str, str]]:
         return self.state.get('status_pages', [])
@@ -22,12 +26,9 @@ class IncidentDataStore:
     def get_logs(self) -> List[Dict[str, Any]]:
         return self.state.get('logs', [])
 
-class IncidentAnalysisEnv(ToolEnv):
-    def __init__(self, incident_data: Dict[str, Any], judge_client, **kwargs):
+class IncidentAnalysisEnv(vf.ToolEnv):
+    def __init__(self, judge_client, dataset=None, **kwargs):
         rubric = IncidentAnalysisRubric(judge_client)
-        super().__init__(rubric=rubric, **kwargs)
-        # Store the shared data object
-        self.incident_store = IncidentDataStore(incident_data)
         
         tools = [
             self.check_status_pages,
@@ -73,20 +74,36 @@ When you have enough information:
 </answer>
 """
         super().__init__(
+            dataset=dataset,
             tools=tools,
             system_prompt=system_prompt,
+            rubric=rubric,
             **kwargs
         )
 
-    def check_status_pages(self, service: str = "") -> str:
-        """Check the status of services from status pages.
-        
-        Args:
-            service: Optional service name to filter by (e.g., 'stripe', 'aws')
-            
-        Returns:
-            Status information for services
+    async def rollout(self,
+                      client,
+                      model: str,
+                      prompt,
+                      answer: str,
+                      task: str = "default",
+                      info: Dict[str, Any] = {},
+                      sampling_args: Dict[str, Any] = {},
+                      **kwargs) -> tuple:
         """
+        Override rollout to set up incident store for each rollout.
+        """
+        # Extract state from info (this is where the dataset row will be passed)
+        if 'state' in info:
+            self.incident_store = IncidentDataStore(info)
+        else:
+            # Create empty state as fallback
+            self.incident_store = IncidentDataStore({'state': {}})
+        
+        return await super().rollout(client, model, prompt, answer, task, info, sampling_args, **kwargs)
+
+    def check_status_pages(self, service: str = "") -> str:
+        """Check the status of services from status pages."""
         status_pages = self.incident_store.get_status_pages()
         
         if not status_pages:
@@ -94,22 +111,30 @@ When you have enough information:
         
         results = []
         for page in status_pages:
-            for service_name, status in page.items():
+            # Handle different formats from the dataset
+            if isinstance(page, dict):
+                for service_name, status in page.items():
+                    if not service or service.lower() in service_name.lower():
+                        if isinstance(status, dict):
+                            # Handle format: {'service': 'name', 'status': 'healthy', 'message': ''}
+                            service_status = status.get('status', 'unknown')
+                            message = status.get('message', '')
+                            results.append(f"{service_name}: {service_status}" + (f" - {message}" if message else ""))
+                        else:
+                            # Handle format: {'service_name': 'status_string'}
+                            results.append(f"{service_name}: {status}")
+            else:
+                # Handle list format from dataset
+                service_name = page.get('service', 'unknown')
+                status = page.get('status', 'unknown')
+                message = page.get('message', '')
                 if not service or service.lower() in service_name.lower():
-                    results.append(f"{service_name}: {status}")
+                    results.append(f"{service_name}: {status}" + (f" - {message}" if message else ""))
         
         return "\n".join(results) if results else f"No status found for service: {service}"
 
     def search_slack_messages(self, query: str, limit: int = 10) -> str:
-        """Search Slack messages for relevant information.
-        
-        Args:
-            query: Search terms to look for in message content
-            limit: Maximum number of messages to return
-            
-        Returns:
-            Relevant Slack messages with timestamps
-        """
+        """Search Slack messages for relevant information."""
         slack_messages = self.incident_store.get_slack_messages()
         
         if not slack_messages:
@@ -118,11 +143,14 @@ When you have enough information:
         # Simple text search in message content
         matching_messages = []
         for msg in slack_messages:
-            content = msg.get('content', '').lower()
-            if query.lower() in content:
+            # Handle different message formats from dataset
+            content = msg.get('message', msg.get('content', ''))
+            if query.lower() in content.lower():
                 timestamp = msg.get('datetime', 'Unknown time')
                 user = msg.get('user', 'Unknown user')
-                matching_messages.append(f"[{timestamp}] {user}: {msg.get('content', '')}")
+                channel = msg.get('channel', '')
+                channel_info = f"#{channel} " if channel else ""
+                matching_messages.append(f"[{timestamp}] {channel_info}{user}: {content}")
         
         # Sort by timestamp and limit results
         matching_messages = matching_messages[:limit]
@@ -133,14 +161,7 @@ When you have enough information:
         return "\n\n".join(matching_messages)
 
     def check_deployment_failures(self, hours_back: int = 24) -> str:
-        """Check for recent deployment failures.
-        
-        Args:
-            hours_back: How many hours back to check for deployments
-            
-        Returns:
-            Information about recent deployments and their status
-        """
+        """Check for recent deployment failures."""
         deployments = self.incident_store.get_deployments()
         
         if not deployments:
@@ -173,15 +194,7 @@ When you have enough information:
         return "\n".join(recent_deployments)
 
     def query_logs(self, error_pattern: str = "", limit: int = 20) -> str:
-        """Query application logs for errors or patterns.
-        
-        Args:
-            error_pattern: Pattern to search for in logs (e.g., 'error', '500', 'exception')
-            limit: Maximum number of log entries to return
-            
-        Returns:
-            Relevant log entries
-        """
+        """Query application logs for errors or patterns."""
         logs = self.incident_store.get_logs()
         
         if not logs:
@@ -189,7 +202,8 @@ When you have enough information:
         
         matching_logs = []
         for log_entry in logs:
-            log_content = str(log_entry).lower()
+            # Handle different log formats from dataset
+            log_content = log_entry.get('message', str(log_entry)).lower()
             
             # If no pattern specified, look for common error indicators
             if not error_pattern:
@@ -218,12 +232,48 @@ When you have enough information:
         
         return "\n".join(formatted_logs)
 
-def create_incident_env(incident_data):
-    """Create an environment for incident analysis."""
-    return IncidentAnalysisEnv(
-        incident_data=incident_data,
+
+def load_incident_dataset(dataset_name: str = "cdreetz/on-call-agent-grpo-dataset", split: str = "train"):
+    """Load the incident dataset from HuggingFace."""
+    dataset = load_dataset(dataset_name, split=split)
+    
+    # Add preprocessing to ensure compatibility
+    def preprocess_dataset_row(example):
+        # Ensure state is properly parsed if it's a string
+        if isinstance(example['state'], str):
+            try:
+                example['state'] = json.loads(example['state'])
+            except json.JSONDecodeError:
+                pass
+        
+        # Ensure consistent format
+        return {
+            'question': example['question'],
+            'answer': example['answer'],
+            'state': example['state'],
+            'issue_type': example.get('issue_type', 'unknown')
+        }
+    
+    dataset = dataset.map(preprocess_dataset_row)
+    return dataset
+
+
+def create_incident_env(judge_client, dataset_name: str = "cdreetz/on-call-agent-grpo-dataset"):
+    """Create an environment for incident analysis using HuggingFace dataset."""
+    
+    # Load the dataset
+    dataset = load_incident_dataset(dataset_name, split="train")
+    eval_dataset = load_incident_dataset(dataset_name, split="train")  # You might want a separate eval split
+    
+    # Create environment
+    env = IncidentAnalysisEnv(
+        judge_client=judge_client,
+        dataset=dataset,
+        eval_dataset=eval_dataset,
         max_turns=10  
     )
+    
+    return env
 
 incident_data = {
     'question': "INCIDENT ALERT - INC-12345\nTitle: Payment Processing Failures\nUsers reporting failed payments on checkout",
@@ -264,5 +314,5 @@ incident_data = {
 }
 
 # Create the environment
-env = create_incident_env(incident_data)
+#env = create_incident_env(incident_data)
 

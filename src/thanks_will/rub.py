@@ -41,7 +41,7 @@ Respond with only "Yes" or "No".
     def count_tool_calls(self, completion) -> int:
         if isinstance(completion, str):
             return completion.count('<tool>')
-        elif isinstance(completion, list)
+        elif isinstance(completion, list):
             tool_calls = 0
             for message in completion:
                 if message.get('role') == 'assistant':
