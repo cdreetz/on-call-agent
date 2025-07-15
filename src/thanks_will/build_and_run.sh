@@ -46,10 +46,20 @@ docker run -d \
     -p 8000:8000 \
     --gpus '"device=0,1"' \
     grpo-training \
-    bash -c "cd /workspace && CUDA_VISIBLE_DEVICES=0,1 vf-vllm --model Qwen/Qwen3-4B"
+    bash -c "cd /workspace && vllm serve --model Qwen/Qwen3-4B --host 0.0.0.0 --port 8000"
 
 echo "Waiting for VLLM server to start..."
 sleep 30
+
+# Check if VLLM server is running
+if ! docker ps | grep -q vllm-server; then
+    echo "Error: VLLM server failed to start"
+    echo "VLLM server logs:"
+    docker logs vllm-server
+    exit 1
+fi
+
+echo "VLLM server is running successfully"
 
 # Run training on GPUs 2,3
 echo "Starting GRPO training..."
