@@ -1,6 +1,11 @@
+## In Summary
+
+- In initial testing Qwen3 is actually a great model to start here because it already is good at structured output/tool calling, and it inherently reasons, which is good for deciding if need more tool calls or a diagnosis has been reached.
+- The environment and reward are designed in a way that allows the model to learn implicit heuristics that minimize MTTR. In early steps it will prioritize the primary reward for correctness and continue to make better diagnosis with no regard to number of tool calls or tokens used, but over time will begin to reach diagnosis more quickly with less tool calls through the ramped reward for min tool calls, where the max reward for efficiency is 1.0 with -0.1 for every tool call it makes.
+
 ## Environment Design: Overview and Rationale
 
-- Goal of the environment is to simulate that of a real on call engineer and the actions they take to resolve the incident
+- Goal of the environment is to simulate that of a real on call engineer and the actions they take to resolve an incident
 - While also ensuring a level of complexity that allows the model to learn to perform what will be real world actions without over burdening it with noise that slows the learning unnecessarily
 - On-call engineer heuristics are built in including checking status pages, checking slack channels, checking recent deployments, and finally querying observability logging and traces
 
