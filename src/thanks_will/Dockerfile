@@ -18,6 +18,9 @@ RUN pip install --upgrade pip
 # Install verifiers library
 RUN pip install 'verifiers[all]'
 
+# Install VLLM for inference server
+RUN pip install vllm
+
 # Install other ML dependencies
 RUN pip install \
     transformers==4.36.0 \

@@ -43,8 +43,11 @@ docker run -d \
     -v $(pwd)/cache:/root/.cache \
     -p 8000:8000 \
     --gpus '"device=0,1"' \
+    --ipc=host \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
     grpo-training \
-    bash -c "cd /workspace && CUDA_VISIBLE_DEVICES=0,1 python -m verifiers.inference.vllm_server --model Qwen/Qwen3-4B --host 0.0.0.0 --port 8000"
+    bash -c "cd /workspace && CUDA_VISIBLE_DEVICES=0,1 vllm serve --model Qwen/Qwen3-4B --host 0.0.0.0 --port 8000"
 
 echo "Waiting for VLLM server to start..."
 sleep 30
@@ -73,6 +76,9 @@ docker run \
     -v $(pwd)/outputs:/workspace/outputs \
     -v $(pwd)/cache:/root/.cache \
     --gpus '"device=2,3"' \
+    --ipc=host \
+    --ulimit memlock=-1 \
+    --ulimit stack=67108864 \
     --network container:vllm-server \
     grpo-training \
     bash -c "cd /workspace && CUDA_VISIBLE_DEVICES=2,3 accelerate launch --config-file configs/zero3.yaml main.py"
