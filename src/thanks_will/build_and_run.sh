@@ -44,7 +44,7 @@ docker run -d \
     -p 8000:8000 \
     --gpus '"device=0,1"' \
     grpo-training \
-    bash -c "cd /workspace && CUDA_VISIBLE_DEVICES=0,1 vf-vllm --model Qwen/Qwen3-4B --host 0.0.0.0 --port 8000"
+    bash -c "cd /workspace && CUDA_VISIBLE_DEVICES=0,1 python -m verifiers.inference.vllm_server --model Qwen/Qwen3-4B --host 0.0.0.0 --port 8000"
 
 echo "Waiting for VLLM server to start..."
 sleep 30
