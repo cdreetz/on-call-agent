@@ -38,7 +38,6 @@ docker build -t grpo-training .
 echo "Starting VLLM inference server..."
 docker run -d \
     --name vllm-server \
-    --runtime=nvidia \
     -e CUDA_VISIBLE_DEVICES=0,1 \
     -e NVIDIA_VISIBLE_DEVICES=0,1 \
     -v $(pwd):/workspace \
@@ -56,7 +55,6 @@ sleep 30
 echo "Starting GRPO training..."
 docker run \
     --name grpo-trainer \
-    --runtime=nvidia \
     -e CUDA_VISIBLE_DEVICES=2,3 \
     -e NVIDIA_VISIBLE_DEVICES=2,3 \
     -e OPENAI_API_KEY="$OPENAI_API_KEY" \
