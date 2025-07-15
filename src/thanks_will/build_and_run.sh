@@ -28,13 +28,11 @@ fi
 # Create necessary directories
 mkdir -p models outputs cache
 
-# No need to create zero3.yaml - using the one from verifiers repo
-
 # Build the Docker image
 echo "Building Docker image..."
 docker build -t grpo-training .
 
-# Start inference server on GPUs 0,1
+# Start VLLM inference server on GPUs 0,1
 echo "Starting VLLM inference server..."
 docker run -d \
     --name vllm-server \
@@ -46,7 +44,7 @@ docker run -d \
     -p 8000:8000 \
     --gpus '"device=0,1"' \
     grpo-training \
-    bash -c "cd /workspace && vllm serve --model Qwen/Qwen3-4B --host 0.0.0.0 --port 8000"
+    bash -c "cd /workspace && CUDA_VISIBLE_DEVICES=0,1 vf-vllm --model Qwen/Qwen3-4B --host 0.0.0.0 --port 8000"
 
 echo "Waiting for VLLM server to start..."
 sleep 30
