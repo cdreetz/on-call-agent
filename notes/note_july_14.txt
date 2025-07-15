@@ -1,0 +1,135 @@
+
+
+
+example tool method:
+def check_status_pages(service_filter: str = None) -> str:
+    """Check the status of service status pages.
+    
+    Args:
+        service_filter (str): Optional filter to check specific services by name.
+
+    Returns:
+        str: Status information for services including current status, incidents, and key metrics.
+
+    Examples:
+        check_status_pages() -> Returns status for all services
+        check_status_pages("payment") -> Returns status for payment-related services
+    """
+    # Get the environment state from somewhere accessible
+    # This would need to be passed or accessible globally
+    status_pages = get_current_env_state().get('status_pages', {})
+    
+    if service_filter:
+        filtered_pages = {k: v for k, v in status_pages.items() 
+                        if service_filter.lower() in k.lower()}
+    else:
+        filtered_pages = status_pages
+    
+    if not filtered_pages:
+        return f"No status pages found for filter: {service_filter}"
+    
+    result = "=== Service Status ===\n"
+    for service_name, page in filtered_pages.items():
+        result += f"\n[SERVICE] {service_name}:\n"
+        result += f"  Status: {page.status.upper()}\n"
+        result += f"  Last Updated: {page.last_updated.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        
+        if page.incidents:
+            result += "  Recent Incidents:\n"
+            for incident in page.incidents[-3:]:
+                result += f"    - {incident['title']} ({incident['status']})\n"
+    
+    return result
+
+
+
+
+system_prompt = """You are an on-call engineer responding to incidents. You have access to the following tools for investigating issues:
+
+{tool_descriptions}
+
+You will be given an incident alert, and you must use the tools to diagnose the root cause.
+
+You may make up to 15 tool calls before giving your final diagnosis.
+
+In each turn, respond in the following format:
+
+<think>
+[your thoughts here]
+</think>
+<tool>
+{{
+    "name": "check_status_pages",
+    "args": {{
+        "service_filter": "payment"
+    }}
+}}
+</tool>
+
+When you have found the root cause, respond in the following format:
+<think>
+[your thoughts here]
+</think>
+<answer>
+[final diagnosis here]
+</answer>
+"""
+
+i like JudgeRubric because it generalizes well and can use it for the primary reward which is correct diagnosis.  so once the agent has finished we give its diagnosis and source of diagnosis to the Judge and ask if it is correct. correct means, if the incident is due to a dependency being down, the agent can diagnose by checking the status pages which will immediately tell it if one of the deps is down.  
+
+a secondary reward which i dont know how we will assign yet, is a reward for efficiency, either in a minimize output tokens or minimize number of tool calls.  the thought process being the agent will likely learn to use tools and diagnose correctly, but we also want to get it to achieve this as quickly and cheaply as possible which is directly correlated with the number of tokens generated which is also the number of tool calls it makes.
+
+in large we want the model to learn the heuristics that on call engineers learn which is when responding to a ping, they start by checking things that are likely causes and quick checks, like checking dep status pages.  then after those are confirmed not the issue they move to more time consuming and less likely causes.   
+
+so really the rubric and reward design plus the generated observability data will hopefully reflect the natural occurrences that result in the model learning these heuristics.  i think to achieve this maybe all it would take is during the data generation, we give probabilities to each of the possible incident causes like 50% prob of status page dep downage, 20% prob of slack message dep down, 20% prob of recent deployment causing downage, and 10% prob that none of the above was the cause and doing in depth log analysis is necessary.
+
+
+
+what is the impact of just doing a simple inverse of tool call count? will it basically just be like, max efficieny reward is 1.0, and subtract 0.1 from the max for every tool call it makes? assuming all candidate generations for a group get the correctness reward of 2.0, then some of them get it correct on the first call so their total reward is 2.9 and those that took 5 calls get a total reward of 2.5. 
+
+
+{
+ 'question': "INCIDENT ALERT - INC-12345\nTitle: Payment Processing Failures\n...",
+ 'answer': "stripe is down", 
+ 'source': "status_page",
+ 'state': {
+   'status_pages': [
+     {'stripe': 'healthy'},
+   ],
+   'slack': [
+      {message data like datetime, content}
+   ]
+   'deployments': [
+     {datetime, succeeded, etc}
+   ]
+   'logs': [
+     {datetime, response time, etc}
+   ]
+ }  
+}
+
+im not sure what the best way to hold and make the state accessible
+
+im not sure the detail of the realistic logs or stuff is that important. basically just enough so that when the agent goes to check one of the things with the corresponding tool and gets the data back its able to determine if that was the cause of the incident.
+
+imagine at this point we are looking to design everything in a way that scales, meaning the way we train and design the environment and data translates to larger scale and more realistic scenarios.  so at this point we can think about the design where we have a probability of incident causes and a cost for making tool calls.  even if the logging or other things arent very realistic, the model should still learn to get correct diagnosis via tool calls, learn to prioritize efficiency, and is able to look at tool responses and determine if it is problematic.  if were able to prove this mock example works, we already know it will translate to real world because we built in the probabilities based on the real world.  
+
+the data could literally be randomized characters and as long as the model is able to learn to use tools, determine if tool responses are diagnosis, and learn efficiency through minimizing tool calls given a group of all correct paths where we reward the one with the least calls the most.
+
+realism of logs isnt something to worry too much about, but more importantly it should represent the patterns of real data which means it can later be swapped for real data if need be.
+
+
+
+=====
+in the spirit of CF i considered using something like Durable Objects for the state management but think it would be overkill and just make finishing this take longer than need
+i think it would be helpful down the line when moving towards making the env more realistic or complex
+but as stated above, i dont think the realism of the logs or anything is a priority in this stage
+whether we hold all the data in some global object or stateful class or in a real sql db in a durable object doesnt really make a difference in terms of training the model
+
+plus, i would want to spend some time talking to an obs eng to better understand the data if im going to go through the trouble of making it more realistic
+
+
+
+
+
+
