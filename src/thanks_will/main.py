@@ -27,9 +27,11 @@ model, tokenizer = vf.get_model_and_tokenizer(model_name)
 run_name = "on-call-agent-grpo_" + model_name.split("/")[-1].lower()
 
 training_args=vf.grpo_defaults(run_name=run_name)
-training_args.per_device_train_batch=12
-training_args.num_generations=24
-training_args.gradient_accumulation_steps=12
+
+training_args.per_device_train_batch=8
+training_args.num_generations=16
+training_args.gradient_accumulation_steps=8
+
 training_args.num_iterations=1
 training_args.num_train_epochs=5
 training_args.max_prompt_length=1024
