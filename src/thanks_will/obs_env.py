@@ -1,5 +1,5 @@
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Union
 from datetime import datetime
 import re
 import verifiers as vf
@@ -26,15 +26,65 @@ class IncidentDataStore:
     def get_logs(self) -> List[Dict[str, Any]]:
         return self.state.get('logs', [])
 
+# Define tools as standalone functions (following verifiers pattern)
+def check_status_pages(service: str = "") -> str:
+    """Check the status of services from status pages.
+    
+    Args:
+        service: Service name to check (optional, if empty checks all)
+        
+    Returns:
+        Status information for the service(s)
+    """
+    # This will be patched during rollout to access the incident store
+    return "Tool not properly initialized"
+
+def search_slack_messages(query: str, limit: int = 10) -> str:
+    """Search Slack messages for relevant information.
+    
+    Args:
+        query: Search query to look for in messages
+        limit: Maximum number of results to return
+        
+    Returns:
+        Matching Slack messages
+    """
+    # This will be patched during rollout to access the incident store
+    return "Tool not properly initialized"
+
+def check_deployment_failures(hours_back: int = 24) -> str:
+    """Check for recent deployment failures.
+    
+    Args:
+        hours_back: How many hours back to check for deployments
+        
+    Returns:
+        Recent deployment information
+    """
+    # This will be patched during rollout to access the incident store
+    return "Tool not properly initialized"
+
+def query_logs(error_pattern: str = "", limit: int = 20) -> str:
+    """Query application logs for errors or patterns.
+    
+    Args:
+        error_pattern: Pattern to search for in logs (optional)
+        limit: Maximum number of log entries to return
+        
+    Returns:
+        Matching log entries
+    """
+    # This will be patched during rollout to access the incident store
+    return "Tool not properly initialized"
+
 class IncidentAnalysisEnv(vf.ToolEnv):
     def __init__(self, judge_client, dataset=None, **kwargs):
-        rubric = IncidentAnalysisRubric(judge_client)
-        
+        # Create tools list
         tools = [
-            self.check_status_pages,
-            self.search_slack_messages, 
-            self.check_deployment_failures,
-            self.query_logs,
+            check_status_pages,
+            search_slack_messages,
+            check_deployment_failures,
+            query_logs,
         ]
         
         system_prompt = """
@@ -73,23 +123,33 @@ When you have enough information:
 [final answer here]
 </answer>
 """
+        
+        # Create rubric
+        rubric = IncidentAnalysisRubric(judge_client)
+
+        print("Tools list:")
+        for i, tool in enumerate(tools):
+            print(f" {i}: {repr(tool)} (type: {type(tool)})")
+
+        
+        # Initialize parent with proper arguments
         super().__init__(
-            dataset=dataset,
             tools=tools,
             system_prompt=system_prompt,
-            rubric=rubric,
-            **kwargs
+            dataset=dataset,
+            max_turns=kwargs.get('max_turns', 10),
+            **{k: v for k, v in kwargs.items() if k != 'max_turns'}
         )
 
     async def rollout(self,
                       client,
                       model: str,
-                      prompt,
+                      prompt: Union[str, List[Dict[str, Any]]],
                       answer: str,
                       task: str = "default",
                       info: Dict[str, Any] = {},
                       sampling_args: Dict[str, Any] = {},
-                      **kwargs) -> tuple:
+                      **kwargs) -> Tuple[Union[str, List[Dict[str, Any]]], Dict[str, Any]]:
         """
         Override rollout to set up incident store for each rollout.
         """
@@ -100,137 +160,152 @@ When you have enough information:
             # Create empty state as fallback
             self.incident_store = IncidentDataStore({'state': {}})
         
+        # Patch the tool functions to use our incident store
+        self._patch_tools()
+        
         return await super().rollout(client, model, prompt, answer, task, info, sampling_args, **kwargs)
 
-    def check_status_pages(self, service: str = "") -> str:
-        """Check the status of services from status pages."""
-        status_pages = self.incident_store.get_status_pages()
+    def _patch_tools(self):
+        """Patch the global tool functions to use our incident store"""
+        # Create a closure to capture self
+        incident_store = self.incident_store
         
-        if not status_pages:
-            return "No status page data available"
-        
-        results = []
-        for page in status_pages:
-            # Handle different formats from the dataset
-            if isinstance(page, dict):
-                for service_name, status in page.items():
-                    if not service or service.lower() in service_name.lower():
-                        if isinstance(status, dict):
-                            # Handle format: {'service': 'name', 'status': 'healthy', 'message': ''}
-                            service_status = status.get('status', 'unknown')
-                            message = status.get('message', '')
-                            results.append(f"{service_name}: {service_status}" + (f" - {message}" if message else ""))
-                        else:
-                            # Handle format: {'service_name': 'status_string'}
-                            results.append(f"{service_name}: {status}")
-            else:
-                # Handle list format from dataset
-                service_name = page.get('service', 'unknown')
-                status = page.get('status', 'unknown')
-                message = page.get('message', '')
-                if not service or service.lower() in service_name.lower():
-                    results.append(f"{service_name}: {status}" + (f" - {message}" if message else ""))
-        
-        return "\n".join(results) if results else f"No status found for service: {service}"
-
-    def search_slack_messages(self, query: str, limit: int = 10) -> str:
-        """Search Slack messages for relevant information."""
-        slack_messages = self.incident_store.get_slack_messages()
-        
-        if not slack_messages:
-            return "No Slack messages available"
-        
-        # Simple text search in message content
-        matching_messages = []
-        for msg in slack_messages:
-            # Handle different message formats from dataset
-            content = msg.get('message', msg.get('content', ''))
-            if query.lower() in content.lower():
-                timestamp = msg.get('datetime', 'Unknown time')
-                user = msg.get('user', 'Unknown user')
-                channel = msg.get('channel', '')
-                channel_info = f"#{channel} " if channel else ""
-                matching_messages.append(f"[{timestamp}] {channel_info}{user}: {content}")
-        
-        # Sort by timestamp and limit results
-        matching_messages = matching_messages[:limit]
-        
-        if not matching_messages:
-            return f"No Slack messages found matching: {query}"
-        
-        return "\n\n".join(matching_messages)
-
-    def check_deployment_failures(self, hours_back: int = 24) -> str:
-        """Check for recent deployment failures."""
-        deployments = self.incident_store.get_deployments()
-        
-        if not deployments:
-            return "No deployment data available"
-        
-        # Filter recent deployments
-        now = datetime.now()
-        recent_deployments = []
-        
-        for deployment in deployments:
-            # Parse deployment datetime
-            deploy_time_str = deployment.get('datetime', '')
-            try:
-                deploy_time = datetime.fromisoformat(deploy_time_str.replace('Z', '+00:00'))
-                hours_diff = (now - deploy_time).total_seconds() / 3600
-                
-                if hours_diff <= hours_back:
-                    status = "SUCCESS" if deployment.get('succeeded', False) else "FAILED"
-                    service = deployment.get('service', 'Unknown')
-                    version = deployment.get('version', 'Unknown')
-                    recent_deployments.append(
-                        f"{deploy_time_str} - {service} v{version} - {status}"
-                    )
-            except ValueError:
-                continue
-        
-        if not recent_deployments:
-            return f"No deployments found in the last {hours_back} hours"
-        
-        return "\n".join(recent_deployments)
-
-    def query_logs(self, error_pattern: str = "", limit: int = 20) -> str:
-        """Query application logs for errors or patterns."""
-        logs = self.incident_store.get_logs()
-        
-        if not logs:
-            return "No log data available"
-        
-        matching_logs = []
-        for log_entry in logs:
-            # Handle different log formats from dataset
-            log_content = log_entry.get('message', str(log_entry)).lower()
+        def patched_check_status_pages(service: str = "") -> str:
+            """Check the status of services from status pages."""
+            status_pages = incident_store.get_status_pages()
             
-            # If no pattern specified, look for common error indicators
-            if not error_pattern:
-                error_indicators = ['error', 'exception', 'failed', '500', '503', '504']
-                if any(indicator in log_content for indicator in error_indicators):
-                    matching_logs.append(log_entry)
-            else:
-                # Search for specific pattern
-                if error_pattern.lower() in log_content:
-                    matching_logs.append(log_entry)
-        
-        # Limit results and format
-        matching_logs = matching_logs[:limit]
-        
-        if not matching_logs:
-            pattern_msg = f" matching '{error_pattern}'" if error_pattern else " with error indicators"
-            return f"No log entries found{pattern_msg}"
-        
-        formatted_logs = []
-        for log in matching_logs:
-            timestamp = log.get('datetime', 'Unknown time')
-            message = log.get('message', str(log))
-            response_time = log.get('response_time', '')
-            rt_info = f" (RT: {response_time}ms)" if response_time else ""
-            formatted_logs.append(f"[{timestamp}]{rt_info} {message}")
-        
-        return "\n".join(formatted_logs)
+            if not status_pages:
+                return "No status page data available"
+            
+            results = []
+            for page in status_pages:
+                # Handle different formats from the dataset
+                if isinstance(page, dict):
+                    for service_name, status in page.items():
+                        if not service or service.lower() in service_name.lower():
+                            if isinstance(status, dict):
+                                # Handle format: {'service': 'name', 'status': 'healthy', 'message': ''}
+                                service_status = status.get('status', 'unknown')
+                                message = status.get('message', '')
+                                results.append(f"{service_name}: {service_status}" + (f" - {message}" if message else ""))
+                            else:
+                                # Handle format: {'service_name': 'status_string'}
+                                results.append(f"{service_name}: {status}")
+                else:
+                    # Handle list format from dataset
+                    service_name = page.get('service', 'unknown')
+                    status = page.get('status', 'unknown')
+                    message = page.get('message', '')
+                    if not service or service.lower() in service_name.lower():
+                        results.append(f"{service_name}: {status}" + (f" - {message}" if message else ""))
+            
+            return "\n".join(results) if results else f"No status found for service: {service}"
+
+        def patched_search_slack_messages(query: str, limit: int = 10) -> str:
+            """Search Slack messages for relevant information."""
+            slack_messages = incident_store.get_slack_messages()
+            
+            if not slack_messages:
+                return "No Slack messages available"
+            
+            # Simple text search in message content
+            matching_messages = []
+            for msg in slack_messages:
+                # Handle different message formats from dataset
+                content = msg.get('message', msg.get('content', ''))
+                if query.lower() in content.lower():
+                    timestamp = msg.get('datetime', 'Unknown time')
+                    user = msg.get('user', 'Unknown user')
+                    channel = msg.get('channel', '')
+                    channel_info = f"#{channel} " if channel else ""
+                    matching_messages.append(f"[{timestamp}] {channel_info}{user}: {content}")
+            
+            # Sort by timestamp and limit results
+            matching_messages = matching_messages[:limit]
+            
+            if not matching_messages:
+                return f"No Slack messages found matching: {query}"
+            
+            return "\n\n".join(matching_messages)
+
+        def patched_check_deployment_failures(hours_back: int = 24) -> str:
+            """Check for recent deployment failures."""
+            deployments = incident_store.get_deployments()
+            
+            if not deployments:
+                return "No deployment data available"
+            
+            # Filter recent deployments
+            now = datetime.now()
+            recent_deployments = []
+            
+            for deployment in deployments:
+                # Parse deployment datetime
+                deploy_time_str = deployment.get('datetime', '')
+                try:
+                    deploy_time = datetime.fromisoformat(deploy_time_str.replace('Z', '+00:00'))
+                    hours_diff = (now - deploy_time).total_seconds() / 3600
+                    
+                    if hours_diff <= hours_back:
+                        status = "SUCCESS" if deployment.get('succeeded', False) else "FAILED"
+                        service = deployment.get('service', 'Unknown')
+                        version = deployment.get('version', 'Unknown')
+                        recent_deployments.append(
+                            f"{deploy_time_str} - {service} v{version} - {status}"
+                        )
+                except ValueError:
+                    continue
+            
+            if not recent_deployments:
+                return f"No deployments found in the last {hours_back} hours"
+            
+            return "\n".join(recent_deployments)
+
+        def patched_query_logs(error_pattern: str = "", limit: int = 20) -> str:
+            """Query application logs for errors or patterns."""
+            logs = incident_store.get_logs()
+            
+            if not logs:
+                return "No log data available"
+            
+            matching_logs = []
+            for log_entry in logs:
+                # Handle different log formats from dataset
+                log_content = log_entry.get('message', str(log_entry)).lower()
+                
+                # If no pattern specified, look for common error indicators
+                if not error_pattern:
+                    error_indicators = ['error', 'exception', 'failed', '500', '503', '504']
+                    if any(indicator in log_content for indicator in error_indicators):
+                        matching_logs.append(log_entry)
+                else:
+                    # Search for specific pattern
+                    if error_pattern.lower() in log_content:
+                        matching_logs.append(log_entry)
+            
+            # Limit results and format
+            matching_logs = matching_logs[:limit]
+            
+            if not matching_logs:
+                pattern_msg = f" matching '{error_pattern}'" if error_pattern else " with error indicators"
+                return f"No log entries found{pattern_msg}"
+            
+            formatted_logs = []
+            for log in matching_logs:
+                timestamp = log.get('datetime', 'Unknown time')
+                message = log.get('message', str(log))
+                response_time = log.get('response_time', '')
+                rt_info = f" (RT: {response_time}ms)" if response_time else ""
+                formatted_logs.append(f"[{timestamp}]{rt_info} {message}")
+            
+            return "\n".join(formatted_logs)
+
+        # Update the global function references in the tools dict
+        # This patches the functions that the parent ToolEnv will call
+        self.tools['check_status_pages'] = patched_check_status_pages
+        self.tools['search_slack_messages'] = patched_search_slack_messages  
+        self.tools['check_deployment_failures'] = patched_check_deployment_failures
+        self.tools['query_logs'] = patched_query_logs
 
 
 def load_incident_dataset(dataset_name: str = "cdreetz/on-call-agent-grpo-dataset", split: str = "train"):
@@ -270,7 +345,6 @@ def create_incident_env(judge_client, dataset_name: str = "cdreetz/on-call-agent
         judge_client=judge_client,
         dataset=dataset,
         eval_dataset=eval_dataset,
-        max_turns=10  
     )
     
     return env
@@ -315,4 +389,3 @@ incident_data = {
 
 # Create the environment
 #env = create_incident_env(incident_data)
-
