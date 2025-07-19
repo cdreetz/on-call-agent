@@ -1,84 +1,25 @@
 # On-Call Agent
 
-Reinforcement learning framework for training language model-based agents to simulate on-call incident investigation workflows.
+Reinforcement learning environment for training language model-based agents to simulate on-call incident investigation workflows.
 
 ## Features
 
 - Simulated incident investigation environment with synthetic logs, status pages, deployment history, and Slack messages.
 - Reward function combining diagnostic accuracy and investigation efficiency.
-- Configurable training, evaluation, and single-run demo modes.
-- Extensible and modular design.
 
-## Installation
+## How to use
 
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
+- Original from scratch implementation at src/ basically works but is extremely slow so not ideal for GRPO given the need to generate long multiturn,
+- **Recommended**: Use src/thanks_will/ which is the same environment but uses the verifiers package which natively supports a lot of nice things like overlappted training + inference, inference through vLLM, nice environment and rubric abstractions, and tons more
 
-> **Note:** Ensure that PyTorch is installed (CPU or GPU version) as required by your setup:
-> ```bash
-> pip install torch torchvision
-> ```
-
-## Quickstart
-
-### Generate a sample training configuration
+## Getting Started
 
 ```bash
-python -m src.main --mode config
-# Edit training_config.json to customize parameters
-```
-
-### Training
-
-```bash
-python -m src.main --mode train --config training_config.json
-```
-
-### Evaluation
-
-```bash
-python -m src.main --mode eval --scenarios 20
-```
-
-### Demo
-
-```bash
-python -m src.main --mode demo
-```
-
-## Project Structure
+cd src/thanks_will
+CUDA_VISIBLE_DEVICES=0 uv run vf-verifiers --model Qwen/Qwen3-4B --tensor-parallel-size 1
+CUDA_VISIBLE_DEVICES=1 uv run accelerate launch --config-file configs/zero3.yaml main.py
 
 ```
-.
-├── pyproject.toml        # Project metadata and dependencies
-├── README.md             # This file
-├── notes.md              # Design notes and rationale
-└── src
-    ├── environment.py    # Simulation environment and scenario generator
-    ├── trainer.py        # Training routines (GRPO training)
-    ├── main.py           # Entry point and CLI
-    ├── ...
-    └── tests             # Unit tests
-```
-
-## Configuration
-
-All training parameters can be customized via the generated `training_config.json` file, including model name, batch size, number of episodes, reward weights, and more.
-
-## Testing
-
-Run the unit tests with:
-
-```bash
-pytest
-```
-
-## Design Notes
-
-Architectural and algorithmic design details, including environment design, reward function rationale, and planned ablation studies, can be found in [notes.md](notes.md).
 
 ## Contributing
 
